@@ -5,7 +5,6 @@ from functools import cached_property
 from pathlib import Path
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 from yaml import safe_load
 
 
@@ -52,9 +51,6 @@ class Route:
         self.tangent = tangent
         self.distance = np.r_[0, np.cumsum(self.lengths)].astype(np.float32)
         self.total = float(self.distance[-1])
-        # Columns are the vehicle's forward, left, and up axes; quaternion order xyzw.
-        frames = np.stack([tangent, np.cross(self.up, tangent), self.up], axis=2)
-        self.rotations = Rotation.from_matrix(frames).as_quat().astype(np.float32)
 
 
 @dataclass
@@ -96,6 +92,8 @@ class Track:
 
     @classmethod
     def load(cls, path):
+        if str(path) in ("flat", "ramp", "bank"):
+            return demo_track(str(path))
         path = Path(path)
         meta = safe_load(path.read_text())
         if "image" in meta:
@@ -134,27 +132,15 @@ class Track:
         return np.stack([vertices.min(axis=0), vertices.max(axis=0)])
 
 
-def ribbon(route, thickness=0.15):
-    """Extrude an authored route into a closed road mesh, including banked surfaces."""
+def ribbon(route):
     left = unit(np.cross(route.up, route.tangent)) * route.half_width[:, None]
-    top = np.stack([route.points + left, route.points - left], axis=1)
-    vertices = np.concatenate(
-        [top, top - thickness * route.up[:, None]], axis=1
-    ).reshape(-1, 3)
+    vertices = np.stack([route.points + left, route.points - left], axis=1).reshape(
+        -1, 3
+    )
     faces = []
     for i in range(len(route.lengths)):
         j = (i + 1) % len(route.points)
-        # A cross-section is [top-left, top-right, bottom-left, bottom-right].
-        for a, b, c, d in [
-            (4 * i, 4 * i + 1, 4 * j + 1, 4 * j),
-            (4 * i + 2, 4 * j + 2, 4 * j + 3, 4 * i + 3),
-            (4 * i, 4 * j, 4 * j + 2, 4 * i + 2),
-            (4 * i + 1, 4 * i + 3, 4 * j + 3, 4 * j + 1),
-        ]:
-            faces.extend([(a, b, c), (a, c, d)])
-    if not route.closed:
-        k = 4 * (len(route.points) - 1)
-        faces.extend([(0, 2, 3), (0, 3, 1), (k, k + 1, k + 3), (k, k + 3, k + 2)])
+        faces.extend([(2 * i, 2 * i + 1, 2 * j + 1), (2 * i, 2 * j + 1, 2 * j)])
     return MeshPart(vertices, faces)
 
 
@@ -170,29 +156,13 @@ def demo_track(kind="ramp"):
             else (0, 0, 1)
         )
         route = Route(points, up, 1.3)
-    elif kind == "overpass":
-        t = np.linspace(0, 2 * np.pi, 256, endpoint=False)
-        # Crossing at t=0/pi is separated vertically by two metres.
-        route = Route(
-            np.column_stack([8 * np.sin(t), 4 * np.sin(2 * t), 1 + np.cos(t)]),
-            half_width=0.85,
-        )
-    elif kind == "jump":
-        x = np.linspace(0, 18, 91)
-        z = np.where(x <= 6, 0, np.where(x < 10, 0.25 * (x - 6), 1.0))
-        route = Route(
-            np.column_stack([x, np.zeros_like(x), z]), half_width=2.5, closed=False
-        )
-        first = Route(route.points[x <= 10], half_width=2.5, closed=False)
-        last = Route(route.points[x >= 10.6], half_width=2.5, closed=False)
-        return Track([ribbon(first), ribbon(last)], route, kind)
     else:
         raise ValueError(f"Unknown demo map: {kind}")
     return Track([ribbon(route)], route, kind)
 
 
 def _image_track(path):
-    from warporacer.legacy import OCC_THRESH, ImageMap
+    from occupancy import OCC_THRESH, ImageMap
 
     image = ImageMap(path)
     xy = image.centerline

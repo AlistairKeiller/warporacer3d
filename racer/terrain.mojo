@@ -1,28 +1,33 @@
-"""Constant-time support queries and conservative distance-field ray marching."""
+"""Road support, conservative clearance, and local route projection."""
 from std.math import floor, sqrt, isfinite
-from .core import Ptr, clamp
-from std.sys import get_defined_int
-
-comptime RANGE = Float32(get_defined_int["RANGE", 10]())
+from .device import Ptr, clamp
 
 
 def validate(map: List[Float32]) raises:
     """Check asset sizes and indices before exposing pointers to kernels."""
-    if len(map) < 16 or map[0] != 314159 or map[1] != 1:
+    if len(map) < 16 or map[0] != 314159 or map[1] != 2:
         raise Error("invalid map; prepare it with prepare.py")
     for value in map:
         if not isfinite(value):
             raise Error("map contains nonfinite values")
-    for i in [2, 3, 4, 10]:
+    for i in [2, 3, 4, 10, 11, 12]:
         if map[i] < 1 or map[i] > 16000000 or map[i] != floor(map[i]):
             raise Error("invalid map dimensions")
     var cells = Int(map[2]) * Int(map[3])
     var count = Int(map[4])
     var route = 16 + 4 * cells
     var spawns = route + 10 * count
-    if cells > 16000000 or len(map) != spawns + Int(map[10]):
+    var tree = spawns + Int(map[10])
+    var nodes = Int(map[11])
+    var triangles = Int(map[12])
+    if cells > 16000000 or len(map) != tree + 9 * (nodes + triangles):
         raise Error("invalid or truncated map")
-    if (map[5] != 0 and map[5] != 1) or map[8] < 0.0049 or map[8] > 0.1001 or map[9] <= 0:
+    if (
+        (map[5] != 0 and map[5] != 1)
+        or map[8] < 0.0049
+        or map[8] > 0.1001
+        or map[9] <= 0
+    ):
         raise Error("invalid map geometry")
     for i in range(count):
         var k = route + i * 10
@@ -32,9 +37,30 @@ def validate(map: List[Float32]) raises:
             or map[k + 8] <= 0
         ):
             raise Error("invalid route segment")
-    for i in range(spawns, len(map)):
+    for i in range(spawns, tree):
         if map[i] < 0 or map[i] >= Float32(count) or map[i] != floor(map[i]):
             raise Error("invalid spawn index")
+    for i in range(nodes):
+        var k = tree + i * 9
+        for axis in range(3):
+            if map[k + axis] > map[k + 3 + axis]:
+                raise Error("invalid ray bounds")
+        if (
+            map[k + 6] <= Float32(i)
+            or map[k + 6] > Float32(nodes)
+            or map[k + 6] != floor(map[k + 6])
+        ):
+            raise Error("invalid ray tree escape")
+        var first = map[k + 7]
+        var count = map[k + 8]
+        if (
+            first < 0
+            or count < 0
+            or first + count > Float32(triangles)
+            or first != floor(first)
+            or count != floor(count)
+        ):
+            raise Error("invalid ray triangle indices")
 
 
 @fieldwise_init
@@ -69,20 +95,9 @@ def surface(map: Ptr, x: Float32, y: Float32) -> Surface:
     )
 
 
-def ray(map: Ptr, x: Float32, y: Float32, dx: Float32, dy: Float32) -> Float32:
-    var distance: Float32 = 0
-    for _ in range(192):
-        var free = surface(map, x + distance * dx, y + distance * dy).clearance
-        if free < 0.005:
-            return distance
-        distance += free
-        if distance >= RANGE:
-            return RANGE
-    # A conservative shortened range at grazing angles; never step over walls.
-    return min(distance, RANGE)
-
-
-def progress(map: Ptr, x: Float32, y: Float32, near: Int32) -> SIMD[DType.float32, 4]:
+def progress(
+    map: Ptr, x: Float32, y: Float32, near: Int32
+) -> SIMD[DType.float32, 4]:
     var count = Int(map[unsafe_offset=4])
     var start = 16 + 4 * Int(map[unsafe_offset=2]) * Int(map[unsafe_offset=3])
     var best: Float32 = 1e30
@@ -98,7 +113,9 @@ def progress(map: Ptr, x: Float32, y: Float32, near: Int32) -> SIMD[DType.float3
         var py = map[unsafe_offset=k + 1]
         var dx = map[unsafe_offset=k + 3]
         var dy = map[unsafe_offset=k + 4]
-        var t = clamp(((x - px) * dx + (y - py) * dy) / (dx * dx + dy * dy), 0, 1)
+        var t = clamp(
+            ((x - px) * dx + (y - py) * dy) / (dx * dx + dy * dy), 0, 1
+        )
         var ex = x - px - t * dx
         var ey = y - py - t * dy
         var dist = ex * ex + ey * ey

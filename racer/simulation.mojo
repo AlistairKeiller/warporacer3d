@@ -1,15 +1,13 @@
 """Fused integration, terminal/reset logic, and parallel distance-field lidar."""
-from std.math import cos, sin, sqrt
-from .core import Ptr, Params, clamp, uniform
-from .terrain import surface, progress, ray, RANGE
+from std.math import sqrt
+from .device import Ptr, Params, clamp, uniform
+from .terrain import surface, progress
+from .lidar import RAYS, RANGE, ray, mount, direction
 from .vehicle import Car, frame, integrate
 
-from std.sys import get_defined_int
-
-comptime BEAMS = get_defined_int["BEAMS", 64]()
-comptime OBS = 8 + BEAMS
+comptime OBS = 8 + RAYS
 comptime STATE = 14
-# Arena begins with state[N,14], observation[N,72], actions[N,2], rewards[N,2].
+# Arena begins with state[N,14], observation[N,OBS], actions[N,2], rewards[N,2].
 # State: x,y,heading,u,v,yaw,steer,progress,steps,episode,grip,motor,return,route segment.
 
 
@@ -45,7 +43,9 @@ def spawn(i: Int, data: Ptr, map: Ptr, p: Params):
     data[unsafe_offset=k] = x
     data[unsafe_offset=k + 1] = y
     data[unsafe_offset=k + 2] = map[unsafe_offset=s + 9]
-    data[unsafe_offset=k + 7] = map[unsafe_offset=s + 7] + 0.5 * map[unsafe_offset=s + 6]
+    data[unsafe_offset=k + 7] = (
+        map[unsafe_offset=s + 7] + 0.5 * map[unsafe_offset=s + 6]
+    )
     data[unsafe_offset=k + 9] = episode
     data[unsafe_offset=k + 13] = Float32(segment)
     data[unsafe_offset=k + 10] = 1.1 * (0.85 + 0.3 * uniform(seed + 1))
@@ -93,7 +93,10 @@ def step(i: Int, data: Ptr, map: Ptr, p: Params):
         # Three overlapping circles enclose the 58 x 38 cm chassis. Inflate
         # their radius by half the swept distance, including turning.
         travel_total += (1.0 / 240.0) * sqrt(car.u * car.u + car.v * car.v)
-        var travel = sqrt((car.x - old_x) * (car.x - old_x) + (car.y - old_y) * (car.y - old_y))
+        var travel = sqrt(
+            (car.x - old_x) * (car.x - old_x)
+            + (car.y - old_y) * (car.y - old_y)
+        )
         var clearance = min(next_ground.clearance, ground.clearance)
         for end in range(-1, 2, 2):
             var old_end_x = old_x + Float32(end) * 0.15 * old_frame.fx
@@ -115,7 +118,9 @@ def step(i: Int, data: Ptr, map: Ptr, p: Params):
             reason = 1
             break
     var ground = surface(map, car.x, car.y)
-    var projection = progress(map, car.x, car.y, Int32(data[unsafe_offset=k + 13]))
+    var projection = progress(
+        map, car.x, car.y, Int32(data[unsafe_offset=k + 13])
+    )
     var next_progress = projection[0]
     data[unsafe_offset=k + 13] = projection[1]
     if projection[2] + 0.19 > projection[3]:
@@ -126,7 +131,9 @@ def step(i: Int, data: Ptr, map: Ptr, p: Params):
         delta = delta - total if delta > total * 0.5 else delta
         delta = delta + total if delta < -total * 0.5 else delta
     # Projection jumps cannot manufacture progress reward.
-    delta = clamp(delta, -travel_total * 1.25 - 0.001, travel_total * 1.25 + 0.001)
+    delta = clamp(
+        delta, -travel_total * 1.25 - 0.001, travel_total * 1.25 + 0.001
+    )
     var reward = 10 * delta - 0.001 * car.steer * car.steer
     var steps = data[unsafe_offset=k + 8] + 1
     if reason > 0:
@@ -155,16 +162,16 @@ def step(i: Int, data: Ptr, map: Ptr, p: Params):
 
 def observe(i: Int, data: Ptr, map: Ptr, p: Params):
     var n = Int(p.envs)
-    var env = i // BEAMS
-    var beam = i % BEAMS
+    var env = i // RAYS
+    var beam = i % RAYS
     var k = env * STATE
     var o = obs_offset(n) + env * OBS
     var x = data[unsafe_offset=k]
     var y = data[unsafe_offset=k + 1]
     var heading = data[unsafe_offset=k + 2]
+    var ground = surface(map, x, y)
+    var f = frame(heading, ground.sx, ground.sy)
     if beam == 0:
-        var ground = surface(map, x, y)
-        var f = frame(heading, ground.sx, ground.sy)
         data[unsafe_offset=o] = data[unsafe_offset=k + 6] / 0.4189
         data[unsafe_offset=o + 1] = data[unsafe_offset=k + 3] / 5
         data[unsafe_offset=o + 2] = data[unsafe_offset=k + 4] / 5
@@ -173,5 +180,6 @@ def observe(i: Int, data: Ptr, map: Ptr, p: Params):
         data[unsafe_offset=o + 5] = -f.lz
         data[unsafe_offset=o + 6] = f.nz
         data[unsafe_offset=o + 7] = min(ground.clearance, 2) / 2
-    var angle = heading - 2.35619449 + Float32(beam) * (4.71238898 / Float32(BEAMS - 1))
-    data[unsafe_offset=o + 8 + beam] = ray(map, x, y, cos(angle), sin(angle)) / RANGE
+    data[unsafe_offset=o + 8 + beam] = (
+        ray(map, mount(x, y, ground.height, f), direction(beam, f)) / RANGE
+    )

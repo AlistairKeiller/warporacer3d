@@ -11,11 +11,43 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt
 from shapely import Polygon, union_all
 
-from warporacer.track import Route, Track
+from track import Route, Track
 
 HEADER = 16
 MAGIC = 314159
-VERSION = 1
+VERSION = 2
+
+
+def ray_geometry(parts):
+    triangles = np.concatenate([part.vertices[part.triangles] for part in parts])
+    lo, hi = triangles.min(axis=1), triangles.max(axis=1)
+    centres = (lo + hi) / 2
+    nodes, order = [], []
+
+    def split(indices):
+        node = len(nodes)
+        nodes.append(None)
+        start, count = 0, 0
+        if len(indices) <= 8:
+            start, count = len(order), len(indices)
+            order.extend(indices)
+        else:
+            axis = np.ptp(centres[indices], axis=0).argmax()
+            middle = len(indices) // 2
+            partition = indices[np.argpartition(centres[indices, axis], middle)]
+            split(partition[:middle])
+            split(partition[middle:])
+        nodes[node] = (
+            *lo[indices].min(axis=0),
+            *hi[indices].max(axis=0),
+            len(nodes),
+            start,
+            count,
+        )
+
+    split(np.arange(len(triangles)))
+    a, b, c = triangles[order].transpose(1, 0, 2)
+    return np.asarray(nodes, np.float32), np.column_stack((a, b - a, c - a))
 
 
 def compile_track(track, resolution=0.025):
@@ -182,8 +214,9 @@ def compile_track(track, resolution=0.025):
     spawns = np.flatnonzero(valid).astype(np.float32)
     if not len(spawns):
         raise ValueError("route has no spawn with vehicle clearance and road support")
+    nodes, triangles = ray_geometry(track.parts)
     header = np.zeros(HEADER, np.float32)
-    header[:11] = (
+    header[:13] = (
         MAGIC,
         VERSION,
         nx,
@@ -194,10 +227,19 @@ def compile_track(track, resolution=0.025):
         resolution,
         route.total,
         len(spawns),
+        len(nodes),
+        len(triangles),
     )
-    return np.concatenate((header, cells.ravel(), segments.ravel(), spawns)).astype(
-        "<f4"
-    )
+    return np.concatenate(
+        (
+            header,
+            cells.ravel(),
+            segments.ravel(),
+            spawns,
+            nodes.ravel(),
+            triangles.ravel(),
+        )
+    ).astype("<f4")
 
 
 def main():

@@ -25,13 +25,15 @@ def permutation(index, n=2, seed=42):
 
 def check(path):
     data = np.fromfile(path, dtype=np.float32)
-    n, samples, batch, count = 2, 64, 16, 9029
-    start = n * (14 + 72 + 4)
+    obs_dim, count = map(int, data[:2])
+    data = data[2:]
+    n, samples, batch = 2, 64, 16
+    start = n * (14 + obs_dim + 4)
     params = torch.tensor(data[start : start + count], requires_grad=True)
     actual = data[start + count : start + count * 2]
     obs_start = start + count * 4
-    obs = data[obs_start : obs_start + samples * 72].reshape(samples, 72)
-    action_start = obs_start + samples * 72
+    obs = data[obs_start : obs_start + samples * obs_dim].reshape(samples, obs_dim)
+    action_start = obs_start + samples * obs_dim
     actions = data[action_start : action_start + samples * 2].reshape(samples, 2)
     value_start = action_start + samples * 2
     old_values, old_logp, _, _, advantages, targets = data[
@@ -39,10 +41,13 @@ def check(path):
     ].reshape(6, samples)
     idx = [permutation(i) for i in range(batch)]
     x = torch.tensor(obs[idx])
-    h1 = torch.tanh(x @ params[:4608].reshape(72, 64) + params[4608:4672])
-    h2 = torch.tanh(h1 @ params[4672:8768].reshape(64, 64) + params[8768:8832])
-    out = h2 @ params[8832:9024].reshape(64, 3) + params[9024:9027]
-    dist = torch.distributions.Normal(out[:, :2], params[9027:].exp())
+    w0, b0, w1, b1, w2, b2, logstd = params.split(
+        [obs_dim * 64, 64, 64 * 64, 64, 64 * 3, 3, 2]
+    )
+    h1 = torch.tanh(x @ w0.reshape(obs_dim, 64) + b0)
+    h2 = torch.tanh(h1 @ w1.reshape(64, 64) + b1)
+    out = h2 @ w2.reshape(64, 3) + b2
+    dist = torch.distributions.Normal(out[:, :2], logstd.exp())
     ratio = (
         dist.log_prob(torch.tensor(actions[idx])).sum(-1) - torch.tensor(old_logp[idx])
     ).exp()

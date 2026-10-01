@@ -1,13 +1,9 @@
-"""A shared 72→64→64 backbone with Gaussian actor and scalar critic heads.
-
-MAX supplies portable matrix multiplication. The six model-specific derivatives
-are explicit; no tensor framework or general-purpose autodiff is needed.
-"""
+"""Shared tanh backbone, Gaussian actor, scalar critic, and explicit backprop."""
 from std.math import tanh, sqrt
 from layout import TileTensor, row_major
 from linalg.matmul import matmul
-from .core import Device, Params, Ptr, normal, clamp, GPU_AVAILABLE
-from .env import OBS, env_size
+from .device import Device, Params, Ptr, normal, clamp, GPU_AVAILABLE
+from .simulation import OBS, env_size
 
 comptime HIDDEN = 64
 comptime W0 = 0
@@ -124,18 +120,25 @@ def initialize(i: Int, data: Ptr, map: Ptr, p: Params):
 
 def mm[
     transpose_b: Bool = False
-](mut device: Device, dest: Int, lhs: Int, rhs: Int, m: Int, n: Int, k: Int) raises:
+](
+    mut device: Device, dest: Int, lhs: Int, rhs: Int, m: Int, n: Int, k: Int
+) raises:
     var a = device.data.create_sub_buffer[DType.float32](lhs, m * k)
     var b = device.data.create_sub_buffer[DType.float32](rhs, k * n)
     var c = device.data.create_sub_buffer[DType.float32](dest, m * n)
     var at = TileTensor(a, row_major(Int32(m), Int32(k)))
     var bt = TileTensor(
-        b, row_major(Int32(n if transpose_b else k), Int32(k if transpose_b else n))
+        b,
+        row_major(
+            Int32(n if transpose_b else k), Int32(k if transpose_b else n)
+        ),
     )
     var ct = TileTensor(c, row_major(Int32(m), Int32(n)))
     comptime if GPU_AVAILABLE:
         if device.gpu:
-            matmul[transpose_b=transpose_b, target="gpu"](ct, at, bt, device.ctx)
+            matmul[transpose_b=transpose_b, target="gpu"](
+                ct, at, bt, device.ctx
+            )
             return
     matmul[transpose_b=transpose_b, target="cpu"](ct, at, bt)
 
@@ -144,21 +147,33 @@ def activation(i: Int, data: Ptr, map: Ptr, p: Params):
     var mem = memory(Int(p.envs))
     var layer = Int(p.index)
     var width = 3 if layer == 2 else HIDDEN
-    var offset = mem.h1 if layer == 0 else (mem.h2 if layer == 1 else mem.output)
+    var offset = mem.h1 if layer == 0 else (
+        mem.h2 if layer == 1 else mem.output
+    )
     var bias = B0 if layer == 0 else (B1 if layer == 1 else B2)
-    var value = data[unsafe_offset=offset + i] + data[unsafe_offset=mem.weights + bias + i % width]
-    data[unsafe_offset=offset + i] = value if layer == 2 else tanh(value)
+    var value = (
+        data[unsafe_offset=offset + i]
+        + data[unsafe_offset=mem.weights + bias + i % width]
+    )
+    value = value if layer == 2 else tanh(value)
+    data[unsafe_offset=offset + i] = value
     if layer != 2 and p.flag > 0:
         var transposed = mem.h1t if layer == 0 else mem.h2t
-        data[unsafe_offset=transposed + (i % width) * Int(p.offset) + i // width] = tanh(value)
+        data[
+            unsafe_offset=transposed + (i % width) * Int(p.offset) + i // width
+        ] = value
 
 
 def forward(mut device: Device, n: Int, batch: Int, training: Bool) raises:
     var mem = memory(n)
     mm(device, mem.h1, mem.x, mem.weights + W0, batch, HIDDEN, OBS)
-    device.run[activation](batch * HIDDEN, Params(Int32(n), 0, Int32(batch), 0, Int32(training)))
+    device.run[activation](
+        batch * HIDDEN, Params(Int32(n), 0, Int32(batch), 0, Int32(training))
+    )
     mm(device, mem.h2, mem.h1, mem.weights + W1, batch, HIDDEN, HIDDEN)
-    device.run[activation](batch * HIDDEN, Params(Int32(n), 0, Int32(batch), 1, Int32(training)))
+    device.run[activation](
+        batch * HIDDEN, Params(Int32(n), 0, Int32(batch), 1, Int32(training))
+    )
     mm(device, mem.output, mem.h2, mem.weights + W2, batch, 3, HIDDEN)
     device.run[activation](batch * 3, Params(Int32(n), 0, Int32(batch), 2, 0))
 

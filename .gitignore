@@ -1,23 +1,8 @@
-# Python-generated files
+.venv/
 __pycache__/
-*.py[oc]
+.ruff_cache/
 build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-logs/
-wandb/
-*.log
-
-# macOS
-.DS_Store
-**/.DS_Store
-
-# Compiled Mojo programs, maps, and checkpoints
+*.py[oc]
 *.wrmap
 *.wrppo
-/racer-bin
+.DS_Store

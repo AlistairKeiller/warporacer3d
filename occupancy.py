@@ -4,7 +4,7 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
-from cv2 import IMREAD_GRAYSCALE, imread
+from PIL import Image
 from scipy.ndimage import convolve, distance_transform_edt, label
 from scipy.signal import savgol_filter
 from skimage.morphology import skeletonize
@@ -21,9 +21,8 @@ class ImageMap:
     def __init__(self, yaml_path: Path):
         yaml_path = Path(yaml_path)
         meta = safe_load(yaml_path.read_text())
-        self.image = imread(str(yaml_path.parent / meta["image"]), IMREAD_GRAYSCALE)
-        if self.image is None:
-            raise FileNotFoundError(yaml_path.parent / meta["image"])
+        with Image.open(yaml_path.parent / meta["image"]) as image:
+            self.image = np.asarray(image.convert("L"))
         self.res = float(meta["resolution"])
         self.ox, self.oy = float(meta["origin"][0]), float(meta["origin"][1])
         self.h, self.w = self.image.shape

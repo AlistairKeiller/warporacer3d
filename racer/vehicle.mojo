@@ -4,7 +4,7 @@ No contacts or wheel bodies. Surface tilt sets the local frame and gravity.
 An implicit two-variable tire update remains stable at zero/reverse speed.
 """
 from std.math import cos, sin, sqrt
-from .core import clamp
+from .device import clamp
 
 comptime DT = Float32(1.0 / 240.0)
 comptime MASS = Float32(3.0)
@@ -33,7 +33,13 @@ def frame(heading: Float32, sx: Float32, sy: Float32) -> Frame:
     var fy = s / length
     var fz = z / length
     return Frame(
-        fx, fy, fz, nz * (-sy * fz - fy), nz * (fx + sx * fz), nz * (sy * fx - sx * fy), nz
+        fx,
+        fy,
+        fz,
+        nz * (-sy * fz - fy),
+        nz * (fx + sx * fz),
+        nz * (sy * fx - sx * fy),
+        nz,
     )
 
 
@@ -49,9 +55,16 @@ struct Car(TrivialRegisterPassable):
 
 
 def integrate(
-    mut car: Car, f: Frame, steering: Float32, throttle: Float32, grip: Float32, motor: Float32
+    mut car: Car,
+    f: Frame,
+    steering: Float32,
+    throttle: Float32,
+    grip: Float32,
+    motor: Float32,
 ):
-    car.steer = clamp(car.steer + clamp(steering, -1, 1) * 3.2 * DT, -0.4189, 0.4189)
+    car.steer = clamp(
+        car.steer + clamp(steering, -1, 1) * 3.2 * DT, -0.4189, 0.4189
+    )
     var c = cos(car.steer)
     var s = sin(car.steer)
     var coefficient = 55 / max(abs(car.u), 0.5)
@@ -73,14 +86,24 @@ def integrate(
     var determinant = a11 * a22 - a12 * a21
     var v = (b1 * a22 - b2 * a12) / determinant
     var yaw = (b2 * a11 - b1 * a21) / determinant
-    var front = clamp(coefficient * (car.u * s - (v + AXLE * yaw) * c), -front_limit, front_limit)
+    var front = clamp(
+        coefficient * (car.u * s - (v + AXLE * yaw) * c),
+        -front_limit,
+        front_limit,
+    )
     var rear = clamp(-coefficient * (v - AXLE * yaw), -rear_limit, rear_limit)
-    var u = car.u + DT * ((drive - front * s) / MASS + yaw * v - 9.81 * f.fz - 0.75 * car.u / MASS)
+    var u = car.u + DT * (
+        (drive - front * s) / MASS + yaw * v - 9.81 * f.fz - 0.75 * car.u / MASS
+    )
     car.v += DT * ((front * c + rear) / MASS - yaw * car.u - 9.81 * f.lz)
     car.yaw += DT * AXLE * (front * c - rear) / INERTIA
     car.u = u
     car.x += DT * (f.fx * car.u + f.lx * car.v)
     car.y += DT * (f.fy * car.u + f.ly * car.v)
     car.heading += DT * car.yaw * f.nz / max(Float32(0.1), 1 - f.fz * f.fz)
-    car.heading = car.heading - 6.283185307 if car.heading > 3.141592654 else car.heading
-    car.heading = car.heading + 6.283185307 if car.heading < -3.141592654 else car.heading
+    car.heading = (
+        car.heading - 6.283185307 if car.heading > 3.141592654 else car.heading
+    )
+    car.heading = (
+        car.heading + 6.283185307 if car.heading < -3.141592654 else car.heading
+    )

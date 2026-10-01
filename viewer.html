@@ -124,36 +124,33 @@
     <h1>WarpORacer <small>Mojo</small></h1>
     <div class="muted" id="map">Loading terrain…</div>
     <div class="row">
-      <button id="pause">Pause</button><button id="reset">Reset cars</button
-      ><button id="step">Step</button>
+      <button id="pause">Pause</button>
+      <button id="reset">Reset cars</button>
+      <button id="step">Step</button>
     </div>
-    <label
-      >Driver
+    <label>Driver
       <select id="driver">
         <option value="manual">Keyboard</option>
         <option value="policy">Policy</option>
-      </select></label
-    >
-    <label
-      >Camera
+      </select>
+    </label>
+    <label>Camera
       <select id="camera">
         <option value="follow">Follow</option>
         <option value="orbit">Orbit</option>
         <option value="top">Top</option>
-      </select></label
-    >
-    <label
-      >Car
-      <select id="car"></select
-    ></label>
-    <label
-      >Speed
+      </select>
+    </label>
+    <label>Car
+      <select id="car"></select>
+    </label>
+    <label>Speed
       <select id="rate">
         <option value="0.25">¼×</option>
         <option value="1" selected>1×</option>
         <option value="4">4×</option>
-      </select></label
-    >
+      </select>
+    </label>
     <label>Lidar <input id="lidar" type="checkbox" checked /></label>
     <label>Route <input id="route" type="checkbox" checked /></label>
     <dl>
@@ -233,22 +230,10 @@
         x = unit(cross([0, 0, 1], z)),
         y = cross(z, x);
       return [
-        x[0],
-        y[0],
-        z[0],
-        0,
-        x[1],
-        y[1],
-        z[1],
-        0,
-        x[2],
-        y[2],
-        z[2],
-        0,
-        -dot(x, eye),
-        -dot(y, eye),
-        -dot(z, eye),
-        1,
+        x[0], y[0], z[0], 0,
+        x[1], y[1], z[1], 0,
+        x[2], y[2], z[2], 0,
+        -dot(x, eye), -dot(y, eye), -dot(z, eye), 1,
       ];
     }
     function perspective(aspect) {
@@ -256,30 +241,17 @@
         near = 0.05,
         far = 300;
       return [
-        f / aspect,
-        0,
-        0,
-        0,
-        0,
-        f,
-        0,
-        0,
-        0,
-        0,
-        (far + near) / (near - far),
-        -1,
-        0,
-        0,
-        (2 * far * near) / (near - far),
-        0,
+        f / aspect, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (far + near) / (near - far), -1,
+        0, 0, (2 * far * near) / (near - far), 0,
       ];
     }
-    function mesh(vertices, colours, mode) {
-      const buffers = [vertices, colours].map((values) => {
-        const b = gl.createBuffer();
-        gl.bindBuffer(gl.ARRAY_BUFFER, b);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(values), gl.STATIC_DRAW);
-        return b;
+    function mesh(vertices, colours, mode, existing = null) {
+      const buffers = existing?.buffers ?? [gl.createBuffer(), gl.createBuffer()];
+      [vertices, colours].forEach((values, i) => {
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffers[i]);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(values), existing ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
       });
       return { buffers, count: vertices.length / 3, mode };
     }
@@ -291,15 +263,13 @@
       });
       gl.drawArrays(m.mode, 0, m.count);
     }
-    function lines(vertices, colour) {
+    function lines(vertices, colour, existing = null) {
       return mesh(
         vertices,
         Array.from({ length: vertices.length / 3 }, () => colour).flat(),
         gl.LINES,
+        existing,
       );
-    }
-    function destroy(m) {
-      m.buffers.forEach((b) => gl.deleteBuffer(b));
     }
     const scene = await fetch("/scene").then((r) => r.json());
     $("map").textContent = scene.name + " · " + scene.cars + " cars";
@@ -414,7 +384,7 @@
         colours.push(...colour);
       }
     }
-    function cars() {
+    function cars(existing) {
       const vertices = [],
         colours = [];
       for (let i = 0; i < scene.cars; i++) {
@@ -457,12 +427,18 @@
             );
           }
       }
-      return mesh(vertices, colours, gl.TRIANGLES);
+      return mesh(vertices, colours, gl.TRIANGLES, existing);
     }
+    const carMesh = mesh([], [], gl.TRIANGLES),
+      trailMesh = lines([], [0.98, 0.65, 0.27]),
+      lidarMesh = lines([], [0.3, 0.48, 0.55]);
     function render() {
       const dpr = Math.min(devicePixelRatio, 2);
-      canvas.width = Math.round(innerWidth * dpr);
-      canvas.height = Math.round(innerHeight * dpr);
+      const width = Math.round(innerWidth * dpr), height = Math.round(innerHeight * dpr);
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
       gl.viewport(0, 0, canvas.width, canvas.height);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
       let target = scene.centre,
@@ -489,28 +465,28 @@
       draw(road);
       if ($("route").checked) draw(route);
       if (state) {
-        const m = cars();
-        draw(m);
-        destroy(m);
+        draw(cars(carMesh));
         const i = Number($("car").value),
-          { s, p, f } = frame(i),
+          { s, p, f, left, up } = frame(i),
           v = [];
         for (let j = 1; j < trails[i].length; j++) v.push(...trails[i][j - 1], ...trails[i][j]);
-        const trail = lines(v, [0.98, 0.65, 0.27]);
-        draw(trail);
-        destroy(trail);
+        draw(lines(v, [0.98, 0.65, 0.27], trailMesh));
         if ($("lidar").checked) {
-          const beams = [];
-          for (let b = 0; b < scene.beams; b++) {
-            const angle = s[2] - Math.PI * 0.75 + (b * Math.PI * 1.5) / (scene.beams - 1),
-              distance = state[scene.cars * scene.state + i * scene.obs + 8 + b] * 10;
-            const x = p[0] + distance * Math.cos(angle),
-              y = p[1] + distance * Math.sin(angle);
-            beams.push(...add(p, [0, 0, 0.07]), x, y, surface(x, y).z + 0.07);
+          const beams = [],
+            origin = add(p, add(scale(f, scene.mount[0]), scale(up, scene.mount[2])));
+          for (let row = 0; row < scene.rows; row++) {
+            const elevation = (row - 1) * scene.elevation;
+            for (let b = 0; b < scene.beams; b++) {
+              const azimuth = -Math.PI * 0.75 + (b * Math.PI * 1.5) / (scene.beams - 1),
+                distance = state[scene.cars * scene.state + i * scene.obs + 8 + row * scene.beams + b] * scene.range,
+                direction = add(
+                  scale(add(scale(f, Math.cos(azimuth)), scale(left, Math.sin(azimuth))), Math.cos(elevation)),
+                  scale(up, Math.sin(elevation)),
+                );
+              beams.push(...origin, ...add(origin, scale(direction, distance)));
+            }
           }
-          const rays = lines(beams, [0.3, 0.48, 0.55]);
-          draw(rays);
-          destroy(rays);
+          draw(lines(beams, [0.3, 0.48, 0.55], lidarMesh));
         }
         $("speed").textContent = Math.hypot(s[3], s[4]).toFixed(2) + " m/s";
         $("grade").textContent =

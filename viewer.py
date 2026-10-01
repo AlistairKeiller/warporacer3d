@@ -1,7 +1,4 @@
-"""Local browser viewer for the Mojo racer: policy playback or keyboard driving.
-
-The server only prepares assets and forwards controls. Mojo owns the simulation.
-"""
+"""Browser viewer and keyboard controls for the native racer."""
 
 import argparse
 import gzip
@@ -15,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from prepare import compile_track
-from warporacer.track import Track
+from track import Track
 
 ROOT = Path(__file__).resolve().parent
 
@@ -55,9 +52,6 @@ def scene(track, data, cars, policy):
         "name": track.name,
         "cars": cars,
         "policy": policy,
-        "state": 14,
-        "obs": 72,
-        "beams": 64,
         "vertices": np.concatenate(vertices).ravel().tolist(),
         "colours": np.concatenate(colours).ravel().tolist(),
         "route": track.route.points.ravel().tolist(),
@@ -79,7 +73,7 @@ def scene(track, data, cars, policy):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("map", type=Path, nargs="?", default=ROOT / "maps/3d/ramp.yaml")
+    parser.add_argument("map", type=Path, nargs="?", default=Path("ramp"))
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument("--cars", type=int, default=1)
@@ -97,13 +91,6 @@ def main():
     binary = build(args.device == "cpu")
     compiled = ROOT / "build" / "viewer.wrmap"
     data.tofile(compiled)
-    payload = gzip.compress(
-        json.dumps(
-            scene(track, data, args.cars, bool(args.checkpoint)),
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode()
-    )
     process = subprocess.Popen(
         [
             str(binary),
@@ -123,9 +110,18 @@ def main():
         line = process.stdout.readline()
         if not line:
             raise RuntimeError(f"Mojo runtime exited during startup ({process.poll()})")
-        if line.startswith("{") and json.loads(line).get("ready"):
-            break
+        if line.startswith("{"):
+            runtime = json.loads(line)
+            if runtime.pop("ready", False):
+                break
         print(line.rstrip())
+    payload = gzip.compress(
+        json.dumps(
+            scene(track, data, args.cars, bool(args.checkpoint)) | runtime,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -144,7 +140,7 @@ def main():
         def do_GET(self):
             if self.path == "/":
                 self.reply(
-                    (ROOT / "ui/viewer.html").read_bytes(), "text/html; charset=utf-8"
+                    (ROOT / "viewer.html").read_bytes(), "text/html; charset=utf-8"
                 )
             elif self.path == "/scene":
                 self.reply(payload, "application/json", compressed=True)

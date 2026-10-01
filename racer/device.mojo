@@ -6,7 +6,9 @@ from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
 from std.math import sqrt, log, cos
 from std.sys import has_accelerator, get_defined_bool
 
-comptime GPU_AVAILABLE = has_accelerator() and not get_defined_bool["CPU_ONLY", False]()
+comptime GPU_AVAILABLE = has_accelerator() and not get_defined_bool[
+    "CPU_ONLY", False
+]()
 
 comptime Ptr = Pointer[Float32, MutAnyOrigin]
 
@@ -14,7 +16,9 @@ comptime Ptr = Pointer[Float32, MutAnyOrigin]
 struct Params(DevicePassable, TrivialRegisterPassable):
     comptime device_type = Self
 
-    def _to_device_type(self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]):
+    def _to_device_type(
+        self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
+    ):
         target.unsafe_bitcast[Self]().write(self)
 
     @staticmethod
@@ -61,21 +65,29 @@ struct Device(Movable):
     var data: DeviceBuffer[DType.float32]
     var terrain: DeviceBuffer[DType.float32]
 
-    def __init__(out self, gpu: Bool, size: Int, map_data: List[Float32]) raises:
+    def __init__(
+        out self, gpu: Bool, size: Int, map_data: List[Float32]
+    ) raises:
         self.gpu = gpu
         comptime if GPU_AVAILABLE:
             self.ctx = DeviceContext() if gpu else DeviceContext(api="cpu")
         else:
             if gpu:
-                raise Error("GPU support is unavailable in this build; select cpu")
+                raise Error(
+                    "GPU support is unavailable in this build; select cpu"
+                )
             self.ctx = DeviceContext(api="cpu")
         self.data = self.ctx.enqueue_create_buffer[DType.float32](size)
-        self.terrain = self.ctx.enqueue_create_buffer[DType.float32](len(map_data))
+        self.terrain = self.ctx.enqueue_create_buffer[DType.float32](
+            len(map_data)
+        )
         self.data.enqueue_fill(0)
         self.ctx.enqueue_copy(self.terrain, map_data.unsafe_ptr())
         self.ctx.synchronize()
 
-    def run[body: def(Int, Ptr, Ptr, Params) thin -> None](mut self, count: Int, p: Params) raises:
+    def run[
+        body: def(Int, Ptr, Ptr, Params) thin -> None
+    ](mut self, count: Int, p: Params) raises:
         comptime if GPU_AVAILABLE:
             if self.gpu:
                 self.ctx.enqueue_function[gpu_kernel[body]](
@@ -88,7 +100,9 @@ struct Device(Movable):
                 )
                 return
         var data = self.data.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
-        var terrain = self.terrain.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        var terrain = self.terrain.unsafe_ptr().unsafe_origin_cast[
+            MutAnyOrigin
+        ]()
 
         def cpu_body(i: Int) {data, terrain, p}:
             body(i, data, terrain, p)
@@ -116,7 +130,9 @@ def uniform(seed: UInt32) -> Float32:
 
 @inline(.always)
 def normal(seed: UInt32) -> Float32:
-    return sqrt(-2.0 * log(uniform(seed))) * cos(6.283185307 * uniform(seed + 0x9E3779B9))
+    return sqrt(-2.0 * log(uniform(seed))) * cos(
+        6.283185307 * uniform(seed + 0x9E3779B9)
+    )
 
 
 def read_floats(path: String) raises -> List[Float32]:

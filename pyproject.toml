@@ -8,42 +8,10 @@ dependencies = [
     "mojo==1.1.0",
     "max==26.6.0",
     "numpy>=2.4.4",
-    "opencv-contrib-python>=4.13.0",
+    "pillow>=12",
     "pyyaml>=6.0.3",
     "scikit-image>=0.26.0",
     "scipy>=1.17.1",
     "shapely>=2,<3",
     "trimesh>=4.6,<5",
 ]
-
-[project.optional-dependencies]
-# Kept for the original Newton runtime and the independent gradient oracle.
-reference = [
-    "imageio[ffmpeg]>=2.37.3",
-    "matplotlib>=3.10.9",
-    "torch>=2.11.0",
-    "typer>=0.24.1",
-    "wandb>=0.26.0",
-    "warp-lang>=1.17,<1.19",
-    "newton==1.6.0",
-]
-viz = [
-    "imgui-bundle>=1.92",
-    "pyglet>=2.1.6,<3",
-]
-
-[tool.uv.sources]
-torch = [
-  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" }, # Actual macOS name
-  { index = "pytorch-cu132", marker = "sys_platform != 'darwin'" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu132"
-url = "https://download.pytorch.org/whl/cu132"
-explicit = true
