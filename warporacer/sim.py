@@ -10,6 +10,8 @@ import warp as wp
 
 from warporacer.vehicle import CarSpec, build_car, motor_controls, steer_targets
 
+wp.set_module_options({"enable_backward": False})
+
 ACT_DIM = 2
 PROPRIO_DIM = 14  # steering, linear/angular velocity, gravity, four wheel contacts
 
@@ -17,8 +19,9 @@ PROPRIO_DIM = 14  # steering, linear/angular velocity, gravity, four wheel conta
 @dataclass(frozen=True)
 class SimConfig:
     dt: float = 1 / 60
-    substeps: int = 24
-    iterations: int = 32
+    substeps: int = 16
+    iterations: int = 12
+    use_graph: bool = True
     max_steps: int = 10_000
     rollover_steps: int = 30
     lidar_beams: int = 108
@@ -90,6 +93,12 @@ def project_route(
     best = wp.vec4(previous, 0.0, 1.0, 0.0)
     best_distance = float(1.0e20)  # noqa: UP018 — mutable Warp loop variable
     for j in range(route.lengths.shape[0]):
+        midpoint = route.distance[j] + 0.5 * route.lengths[j]
+        if (
+            wp.abs(route_delta(midpoint, previous, route))
+            > window + 0.5 * route.lengths[j]
+        ):
+            continue
         d = route.delta[j]
         t = wp.clamp(wp.dot(p - route.points[j], d) / wp.dot(d, d), 0.0, 1.0)
         s = route.distance[j] + t * route.lengths[j]
@@ -217,7 +226,8 @@ def contact_events(
         pa = wp.transform_point(q[shape_body[a]], pa)
     if shape_body[b] >= 0:
         pb = wp.transform_point(q[shape_body[b]], pb)
-    if wp.dot(pb - pa, normal[j]) - margin0[j] - margin1[j] > 0.001:
+    separation = wp.dot(pb - pa, normal[j]) - margin0[j] - margin1[j]
+    if separation > 0.001:
         return
     # Roles: chassis=1, wheel=2, road=3, obstacle=4.
     car = int(a)
@@ -233,7 +243,10 @@ def contact_events(
     if role[car] == 2:
         wp.atomic_max(episodes.grounded, i, wheel_number[car], 1)
     up = wp.quat_rotate(wp.transform_get_rotation(q[root[i]]), wp.vec3(0.0, 0.0, 1.0))
-    if role[car] == 1 or role[map_shape] == 4 or wp.dot(n, up) < 0.3:
+    # Newton also reports nearby, separated pairs; only penetration is a crash.
+    if separation < 0.0 and (
+        role[car] == 1 or role[map_shape] == 4 or wp.dot(n, up) < 0.3
+    ):
         wp.atomic_max(episodes.crashed, i, 1)
 
 
@@ -293,9 +306,8 @@ def race_step(
 def proprioception(
     q: wp.array[wp.transform],
     v: wp.array[wp.spatial_vector],
-    joint_q: wp.array[float],
     root: wp.array[int],
-    steering: wp.array2d[int],
+    steering: wp.array3d[int],
     episodes: Episodes,
     obs: wp.array2d[float],
     poses: wp.array[wp.transform],
@@ -306,8 +318,15 @@ def proprioception(
     linear = wp.quat_rotate_inv(rot, wp.spatial_top(v[root[i]]))
     angular = wp.quat_rotate_inv(rot, wp.spatial_bottom(v[root[i]]))
     gravity = wp.quat_rotate_inv(rot, wp.vec3(0.0, 0.0, -1.0))
-    a, b = joint_q[steering[i, 0]], joint_q[steering[i, 1]]
-    obs[i, 0] = 0.5 * (wp.atan2(wp.sin(a), wp.cos(a)) + wp.atan2(wp.sin(b), wp.cos(b)))
+    angle = float(0.0)  # noqa: UP018 — mutable Warp loop variable
+    for k in range(2):
+        parent = wp.transform_get_rotation(q[steering[i, k, 0]])
+        child = wp.transform_get_rotation(q[steering[i, k, 1]])
+        twist = wp.quat_twist_angle_signed(
+            wp.vec3(0.0, 0.0, 1.0), wp.quat_inverse(parent) * child
+        )
+        angle += wp.atan2(wp.sin(twist), wp.cos(twist))
+    obs[i, 0] = 0.5 * angle
     for k in range(3):
         obs[i, 1 + k] = linear[k]
         obs[i, 4 + k] = angular[k]
@@ -348,6 +367,10 @@ class PhysicsBatch:
         def array(a, dtype):
             return wp.array(a, dtype=dtype, device=device)
 
+        def world_ids(starts):
+            starts = starts.numpy()
+            return np.stack([np.arange(starts[i], starts[i + 1]) for i in range(n)])
+
         self.route = RouteData()
         for name, values, dtype in [
             ("points", track.route.points, wp.vec3),
@@ -363,8 +386,10 @@ class PhysicsBatch:
         builder = newton.ModelBuilder()
         self.meshes = []
         vertices, triangles = [], []
+        vertex_offset = 0
         for part in track.parts:
-            triangles.append(part.triangles + sum(len(v) for v in vertices))
+            triangles.append(part.triangles + vertex_offset)
+            vertex_offset += len(part.vertices)
             vertices.append(part.vertices)
             mesh = newton.Mesh(
                 part.vertices, part.triangles.ravel(), compute_inertia=False
@@ -403,48 +428,66 @@ class PhysicsBatch:
         self.solver = newton.solvers.SolverXPBD(
             self.model, iterations=env.config.iterations
         )
-        self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=256 * n)
+        # Cars collide with map meshes; all internal car contacts are filtered.
+        parts, shapes = len(track.parts), self.model.shape_count
+        pairs = np.column_stack(
+            [
+                np.repeat(np.arange(parts), shapes - parts),
+                np.tile(np.arange(parts, shapes), parts),
+            ]
+        )
+        triangle_pairs = min(
+            1_000_000,
+            (shapes - parts) * sum(len(part.triangles) for part in track.parts),
+        )
+        self.pipeline = newton.CollisionPipeline(
+            self.model,
+            rigid_contact_max=256 * n,
+            max_triangle_pairs=max(256 * n, triangle_pairs),
+            broad_phase="explicit",
+            shape_pairs_filtered=array(pairs, wp.vec2i),
+        )
         self.contacts = self.pipeline.contacts()
         self.state, self.other = self.model.state(), self.model.state()
         self.control = self.model.control()
         # Resolve IDs by world and parentage, rather than relying on buffer strides.
-        worlds = self.model.body_world.numpy()
-        bodies = np.stack([np.flatnonzero(worlds == i) for i in range(n)])
+        bodies = world_ids(self.model.body_world_start)
         self.bodies = array(bodies, int)
         self.root = array(bodies[:, ids["root"]], int)
-        joint_world = self.model.joint_world.numpy()
-        joints = np.stack([np.flatnonzero(joint_world == i) for i in range(n)])
-        q_start, d_start = (
-            self.model.joint_q_start.numpy(),
-            self.model.joint_qd_start.numpy(),
+        joints = world_ids(self.model.joint_world_start)
+        steering = joints[:, ids["steering"]]
+        self.steering_bodies = array(
+            np.stack(
+                [
+                    self.model.joint_parent.numpy()[steering],
+                    self.model.joint_child.numpy()[steering],
+                ],
+                axis=-1,
+            ),
+            int,
         )
-        self.steering_q = array(q_start[joints[:, ids["steering"]]], int)
+        d_start = self.model.joint_qd_start.numpy()
         self.steering_target = array(
             self.model.joint_target_q_start.numpy()[joints[:, ids["steering"]]], int
         )
         self.drive_dof = array(d_start[joints[:, ids["drive"]]], int)
-        self.wheel_bodies = array(bodies[:, [b for b, _ in ids["wheels"]]], int)
+        wheel_bodies = bodies[:, [b for b, _ in ids["wheels"]]]
+        self.wheel_bodies = array(wheel_bodies, int)
         shape_body = self.model.shape_body.numpy()
-        self.wheels = array(
-            [
-                [
-                    np.flatnonzero(shape_body == bodies[i, b])[0]
-                    for b, _ in ids["wheels"]
-                ]
-                for i in range(n)
-            ],
-            int,
-        )
+        # The chassis and each wheel have one collision shape.
+        dynamic_shapes = np.flatnonzero(shape_body >= 0)
+        body_shape = np.full(self.model.body_count, -1)
+        body_shape[shape_body[dynamic_shapes]] = dynamic_shapes
+        wheels = body_shape[wheel_bodies]
+        self.wheels = array(wheels, int)
         roles = np.array(
             [4 if p.obstacle else 3 for p in track.parts]
             + [0] * (self.model.shape_count - len(track.parts))
         )
         wheel_number = np.full(self.model.shape_count, -1)
-        for i in range(n):
-            roles[np.flatnonzero(shape_body == bodies[i, ids["root"]])] = 1
-            for k, (b, _) in enumerate(ids["wheels"]):
-                shape = np.flatnonzero(shape_body == bodies[i, b])[0]
-                roles[shape], wheel_number[shape] = 2, k
+        roles[body_shape[bodies[:, ids["root"]]]] = 1
+        roles[wheels] = 2
+        wheel_number[wheels] = np.arange(4)
         self.roles, self.wheel_number = array(roles, int), array(wheel_number, int)
         self.episodes = Episodes()
         for name in ("target", "motor", "progress"):
@@ -590,16 +633,14 @@ class PhysicsBatch:
     def observe(self):
         cfg = self.env.config
         self.detect_contacts()
-        newton.eval_ik(self.model, self.state, self.state.joint_q, self.state.joint_qd)
         self.launch(
             proprioception,
             self.n,
             [
                 self.state.body_q,
                 self.state.body_qd,
-                self.state.joint_q,
                 self.root,
-                self.steering_q,
+                self.steering_bodies,
                 self.episodes,
                 self.obs,
                 self.poses,
@@ -672,9 +713,14 @@ class Env:
     @contextmanager
     def scope(self):
         """Order environment work between operations on the caller's Torch stream."""
-        caller = torch.cuda.current_stream(self.torch_device) if self.stream else None
-        if caller is not None:
-            self.torch_stream.wait_stream(caller)
+        if self.stream is None:
+            yield
+            return
+        caller = torch.cuda.current_stream(self.torch_device)
+        if caller == self.torch_stream and wp.get_stream(self.device) == self.stream:
+            yield
+            return
+        self.torch_stream.wait_stream(caller)
         try:
             with (
                 wp.ScopedStream(self.stream, sync_exit=True),
@@ -682,8 +728,7 @@ class Env:
             ):
                 yield
         finally:
-            if caller is not None:
-                caller.wait_stream(self.torch_stream)
+            caller.wait_stream(self.torch_stream)
 
     def rotate(self, tracks):
         self.tracks = list(tracks) if isinstance(tracks, (list, tuple)) else [tracks]
@@ -693,6 +738,7 @@ class Env:
         with self.scope():
             if hasattr(self, "batches") and self.device.is_cuda:
                 wp.synchronize_device(self.device)
+            self.graphs = {}
             self.batches = []
             bounds = np.linspace(0, self.num_envs, len(self.tracks) + 1, dtype=int)
             for track, a, b in zip(self.tracks, bounds[:-1], bounds[1:]):
@@ -712,8 +758,22 @@ class Env:
             if self.stream and actions.is_cuda:
                 actions.record_stream(self.torch_stream)
             self.act_t.copy_(actions.detach())
-            for batch in self.batches:
-                batch.step()
+            if not self.config.use_graph:
+                for batch in self.batches:
+                    batch.step()
+            else:
+                # Odd substep counts alternate state buffers and need two graphs.
+                key = id(self.batches[0].state)
+                graph = self.graphs.get(key)
+                if graph is None:
+                    with wp.ScopedCapture(device=self.device) as capture:
+                        for batch in self.batches:
+                            batch.step()
+                    graph = self.graphs[key] = capture.graph
+                elif self.config.substeps % 2:
+                    for batch in self.batches:
+                        batch.state, batch.other = batch.other, batch.state
+                wp.capture_launch(graph)
         return self.obs, self.rew, self.done
 
     def observe(self):

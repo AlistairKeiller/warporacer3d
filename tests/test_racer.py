@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -54,12 +55,13 @@ def place(env, position, rotation=(0, 0, 0, 1), speed=0):
             (rot * Rotation.from_quat(rest[:, 3:])).as_quat(),
         ]
     )
+    pose = np.tile(pose, (batch.n, 1))
     velocity = np.zeros((len(pose), 6), np.float32)
     velocity[:, :3] = rot.apply([speed, 0, 0])
     for state in (batch.state, batch.other):
         state.body_q.assign(pose)
         state.body_qd.assign(velocity)
-    batch.episodes.position.assign([position])
+    batch.episodes.position.assign(np.tile(position, (batch.n, 1)))
     # Find the corresponding arc position once; normal stepping uses a local window.
     route = env.tracks[0].route
     t = np.clip(
@@ -73,7 +75,7 @@ def place(env, position, rotation=(0, 0, 0, 1), speed=0):
             position - (route.points[: len(t)] + t[:, None] * route.delta), axis=1
         )
     )
-    batch.episodes.progress.assign([route.distance[j] + t[j] * route.lengths[j]])
+    batch.episodes.progress.fill_(route.distance[j] + t[j] * route.lengths[j])
     batch.episodes.crashed.zero_()
     env.observe()
 
@@ -98,10 +100,25 @@ def progress_deltas(
 
 
 class PhysicsTests(unittest.TestCase):
+    def test_cpu_with_mps_available(self):
+        # CUDA's null stream context queries a missing MPS API on some Torch builds.
+        with (
+            patch("torch.cuda.is_available", return_value=False),
+            patch("torch.backends.mps.is_available", return_value=True),
+        ):
+            env = Env(straight(), 1, device="cpu", config=SimConfig(**SMALL))
+            obs, reward, done = env.step(torch.zeros((1, 2)))
+            self.assertEqual(obs.device.type, "cpu")
+            self.assertTrue(torch.isfinite(obs).all())
+            self.assertTrue(torch.isfinite(reward).all())
+            self.assertFalse(done.any())
+            env.observe()
+            env.reset()
+
     def test_rest_and_timestep_convergence(self):
         heights = []
-        for substeps in (24, 48):
-            env = environment(substeps=substeps, iterations=32)
+        for substeps in (SimConfig.substeps, 2 * SimConfig.substeps):
+            env = environment(substeps=substeps)
             self.assertEqual(advance(env, 90), [])
             heights.append(float(env.poses_t[0, 2]))
             self.assertLess(float(env.obs[0, 1:7].abs().max()), 0.03)
@@ -135,13 +152,15 @@ class PhysicsTests(unittest.TestCase):
         self.assertGreater(abs(float(env.poses_t[0, 5])), 0.05)
 
     def test_motor_speed_and_unpowered_coasting(self):
-        env = environment()
+        # Cover randomized friction/torque across a batch, including near contacts
+        # whose grazing normals must not trigger spurious collision resets.
+        env = environment(n=32)
         self.assertEqual(advance(env, 150, (0, 0.8)), [])
-        speed = float(env.obs[0, 1])
-        self.assertGreater(speed, 2)
-        self.assertLess(speed, env.car.speed_limit + 0.2)
+        speed = env.obs[:, 1].clone()
+        self.assertGreater(float(speed.min()), 2)
+        self.assertLess(float(speed.max()), env.car.speed_limit + 0.2)
         self.assertEqual(advance(env, 90), [])
-        self.assertLess(float(env.obs[0, 1]), speed - 0.2)
+        self.assertLess(float((env.obs[:, 1] - speed).max()), -0.2)
 
     def test_incline_gravity_and_banking(self):
         env = environment(straight(0.15))
@@ -178,22 +197,75 @@ class PhysicsTests(unittest.TestCase):
         self.assertTrue(bool(torch.isfinite(env.obs).all()))
 
     def test_ramp_gap_takeoff_and_landing(self):
-        env = environment(demo_track("jump"))
+        env = environment(demo_track("jump"), n=32)
         place(env, [4, 0, env.car.ride_height])
-        action = torch.tensor([[0.0, 0.8]], device=env.torch_device)
-        airborne, landed = False, False
+        action = torch.tensor([0.0, 0.8], device=env.torch_device).expand(32, 2)
+        airborne = torch.zeros(32, dtype=torch.bool, device=env.torch_device)
+        landed = torch.zeros_like(airborne)
         for _ in range(220):
             env.step(action)
             self.assertFalse(bool(env.done.any()))
-            contacts = int(env.obs[0, 10:14].sum())
-            x = float(env.poses_t[0, 0])
-            airborne |= x > 10 and contacts == 0
-            landed |= airborne and x > 11.2 and contacts == 4
-        self.assertTrue(airborne)
-        self.assertTrue(landed)
+            contacts = env.obs[:, 10:14].sum(1)
+            x = env.poses_t[:, 0]
+            airborne |= (x > 10) & (contacts == 0)
+            landed |= airborne & (x > 11.2) & (contacts == 4)
+        self.assertTrue(bool(airborne.all()))
+        self.assertTrue(bool(landed.all()))
 
 
 class EnvironmentTests(unittest.TestCase):
+    def test_graph_matches_eager_with_resets_and_odd_substeps(self):
+        for substeps, iterations in (
+            (15, 23),
+            (SimConfig.substeps, SimConfig.iterations),
+        ):
+            tracks = [demo_track("ramp"), demo_track("overpass")]
+            settings = SMALL | {
+                "substeps": substeps,
+                "iterations": iterations,
+                "max_steps": 4,
+            }
+            graph = Env(tracks, 4, device=DEVICE, config=SimConfig(**settings))
+            eager = Env(
+                tracks, 4, device=DEVICE, config=SimConfig(**settings, use_graph=False)
+            )
+            for step in range(7):
+                actions = torch.full(
+                    (4, 2), 0.1 * (step % 3), device=graph.torch_device
+                )
+                for actual, expected in zip(graph.step(actions), eager.step(actions)):
+                    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+                for a, b in zip(graph.batches, eager.batches):
+                    np.testing.assert_allclose(
+                        a.state.body_q.numpy(),
+                        b.state.body_q.numpy(),
+                        atol=2e-4,
+                        rtol=2e-4,
+                    )
+                if step == 2:
+                    graph.reset([1, 0, 0, 1])
+                    eager.reset([1, 0, 0, 1])
+            self.assertEqual(len(graph.graphs), 2 if substeps % 2 else 1)
+            graph.rotate([demo_track("bank"), demo_track("jump")])
+            self.assertEqual(graph.graphs, {})
+            self.assertTrue(torch.isfinite(graph.step(actions)[0]).all())
+
+    def test_large_batch_matches_single_world(self):
+        track = straight()
+        batch, single = environment(track, n=128), environment(track)
+        actions = torch.zeros((128, 2), device=batch.torch_device)
+        actions[:, 1] = 0.4
+        for _ in range(8):
+            for actual, expected in zip(batch.step(actions), single.step(actions[:1])):
+                # Contact reduction order changes tiny angular-velocity rounding.
+                torch.testing.assert_close(actual[:1], expected, atol=3e-3, rtol=2e-4)
+            torch.testing.assert_close(
+                batch.poses_t[:1], single.poses_t, atol=1e-4, rtol=1e-4
+            )
+        self.assertTrue(torch.isfinite(batch.obs).all())
+        self.assertFalse(batch.done.any())
+        self.assertEqual(batch.obs[:, 10:14].sum().item(), 128 * 4)
+
     def test_observation_and_selective_full_car_reset(self):
         env = environment(n=2)
         advance(env, 8, (0.2, 0.3))
@@ -414,12 +486,16 @@ class MapAndLearningTests(unittest.TestCase):
         agent = Agent(env.obs_dim, env.act_dim, hidden=32).to(env.torch_device)
         before = torch.cat([p.detach().flatten().clone() for p in agent.parameters()])
         ppo = PPO(env, agent, rollouts=4, epochs=1, minibatches=2)
+        pointers = [b.data_ptr() for b in ppo.buffer]
         log = ppo.iterate()
         after = torch.cat([p.detach().flatten() for p in agent.parameters()])
         self.assertTrue(all(np.isfinite(v) for v in log.values()))
         self.assertFalse(torch.equal(before, after))
         self.assertEqual(ppo.global_step, 8)
         self.assertIn("ep_return", log)
+        self.assertEqual(list(ppo.finished_lengths), [3, 3])
+        self.assertTrue(all(np.isfinite(v) for v in ppo.iterate().values()))
+        self.assertEqual(pointers, [b.data_ptr() for b in ppo.buffer])
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Requires an NVIDIA CUDA device")

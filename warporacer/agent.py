@@ -31,7 +31,12 @@ class Agent(nn.Module):
         self.log_std = nn.Parameter(torch.full((act_dim,), -0.5))
 
     def dist(self, obs):
-        return Normal(self.actor(obs), self.log_std.clamp(LOGSTD_MIN, LOGSTD_MAX).exp())
+        # The bounded scale is positive; validation would synchronize CUDA here.
+        return Normal(
+            self.actor(obs),
+            self.log_std.clamp(LOGSTD_MIN, LOGSTD_MAX).exp(),
+            validate_args=False,
+        )
 
     def value(self, obs):
         return self.critic(obs).squeeze(-1)

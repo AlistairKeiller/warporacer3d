@@ -1,0 +1,597 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WarpORacer · Mojo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font:
+        14px system-ui,
+        sans-serif;
+      color: #e6edf3;
+      background: #10171e;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+    aside {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      width: 278px;
+      background: #14212bee;
+      border: 1px solid #34424f;
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: 0 10px 40px #0005;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 4px;
+    }
+    small,
+    .muted {
+      color: #94a7b5;
+    }
+    p {
+      line-height: 1.5;
+      margin: 12px 0;
+    }
+    button,
+    select {
+      background: #233542;
+      color: inherit;
+      border: 1px solid #425464;
+      border-radius: 7px;
+      padding: 8px;
+      cursor: pointer;
+    }
+    button:hover {
+      background: #344b5c;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .row > * {
+      flex: 1;
+    }
+    label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 12px 0;
+    }
+    dl {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 9px;
+      margin: 18px 0;
+    }
+    dt {
+      color: #94a7b5;
+    }
+    dd {
+      margin: 0;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+    #status {
+      color: #78dbb6;
+      min-height: 20px;
+    }
+    footer {
+      position: absolute;
+      bottom: 18px;
+      left: 20px;
+      color: #b0c0cd;
+      background: #14212bcc;
+      padding: 10px 14px;
+      border-radius: 8px;
+    }
+    #error {
+      color: #ffaf9d;
+      white-space: pre-wrap;
+    }
+    input {
+      accent-color: #78dbb6;
+    }
+    @media (max-width: 600px) {
+      aside {
+        width: 230px;
+        left: 10px;
+        top: 10px;
+        padding: 14px;
+      }
+      footer {
+        font-size: 12px;
+        left: 10px;
+      }
+    }
+  </style>
+  <canvas id="view"></canvas>
+  <aside>
+    <h1>WarpORacer <small>Mojo</small></h1>
+    <div class="muted" id="map">Loading terrain…</div>
+    <div class="row">
+      <button id="pause">Pause</button><button id="reset">Reset cars</button
+      ><button id="step">Step</button>
+    </div>
+    <label
+      >Driver
+      <select id="driver">
+        <option value="manual">Keyboard</option>
+        <option value="policy">Policy</option>
+      </select></label
+    >
+    <label
+      >Camera
+      <select id="camera">
+        <option value="follow">Follow</option>
+        <option value="orbit">Orbit</option>
+        <option value="top">Top</option>
+      </select></label
+    >
+    <label
+      >Car
+      <select id="car"></select
+    ></label>
+    <label
+      >Speed
+      <select id="rate">
+        <option value="0.25">¼×</option>
+        <option value="1" selected>1×</option>
+        <option value="4">4×</option>
+      </select></label
+    >
+    <label>Lidar <input id="lidar" type="checkbox" checked /></label>
+    <label>Route <input id="route" type="checkbox" checked /></label>
+    <dl>
+      <dt>Speed</dt>
+      <dd id="speed">—</dd>
+      <dt>Grade / height</dt>
+      <dd id="grade">—</dd>
+      <dt>Steering / throttle</dt>
+      <dd id="control">—</dd>
+      <dt>Episode reward</dt>
+      <dd id="reward">—</dd>
+      <dt>Progress</dt>
+      <dd id="progress">—</dd>
+      <dt>Resets / finishes</dt>
+      <dd id="events">0 / 0</dd>
+    </dl>
+    <div id="status">Starting simulation…</div>
+    <div id="error"></div>
+    <p class="muted">W/S or ↑/↓: throttle<br />A/D or ←/→: steer<br />Space: pause · R: reset</p>
+    <small>Drag to orbit · Scroll to zoom<br />Road edges and walls end an episode.</small>
+  </aside>
+  <footer>60 Hz dynamics · terrain-following bicycle · live CPU / GPU simulation</footer>
+  <script type="module">
+    const $ = (id) => document.getElementById(id);
+    const canvas = $("view"),
+      gl = canvas.getContext("webgl", { antialias: true });
+    if (!gl) {
+      $("error").textContent = "WebGL is unavailable in this browser.";
+      throw new Error("WebGL is unavailable in this browser.");
+    }
+    const shader = (type, source) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, source);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const program = gl.createProgram();
+    gl.attachShader(
+      program,
+      shader(
+        gl.VERTEX_SHADER,
+        "attribute vec3 position;attribute vec3 colour;uniform mat4 vp;varying vec3 c;void main(){gl_Position=vp*vec4(position,1.);c=colour;}",
+      ),
+    );
+    gl.attachShader(
+      program,
+      shader(
+        gl.FRAGMENT_SHADER,
+        "precision mediump float;varying vec3 c;void main(){gl_FragColor=vec4(c,1.);}",
+      ),
+    );
+    gl.linkProgram(program);
+    gl.useProgram(program);
+    const vpLocation = gl.getUniformLocation(program, "vp");
+    const attributes = ["position", "colour"].map((x) => gl.getAttribLocation(program, x));
+    gl.enable(gl.DEPTH_TEST);
+    gl.clearColor(0.055, 0.085, 0.11, 1);
+    const add = (a, b) => a.map((v, i) => v + b[i]),
+      sub = (a, b) => a.map((v, i) => v - b[i]),
+      scale = (a, s) => a.map((v) => v * s);
+    const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0),
+      cross = (a, b) => [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+      ];
+    const unit = (a) => scale(a, 1 / Math.max(Math.hypot(...a), 1e-9));
+    const multiply = (a, b) =>
+      Array.from({ length: 16 }, (_, i) => {
+        let s = 0;
+        for (let k = 0; k < 4; k++) s += a[k * 4 + (i % 4)] * b[Math.floor(i / 4) * 4 + k];
+        return s;
+      });
+    function view(eye, target) {
+      const z = unit(sub(eye, target)),
+        x = unit(cross([0, 0, 1], z)),
+        y = cross(z, x);
+      return [
+        x[0],
+        y[0],
+        z[0],
+        0,
+        x[1],
+        y[1],
+        z[1],
+        0,
+        x[2],
+        y[2],
+        z[2],
+        0,
+        -dot(x, eye),
+        -dot(y, eye),
+        -dot(z, eye),
+        1,
+      ];
+    }
+    function perspective(aspect) {
+      const f = 1 / Math.tan(Math.PI / 7),
+        near = 0.05,
+        far = 300;
+      return [
+        f / aspect,
+        0,
+        0,
+        0,
+        0,
+        f,
+        0,
+        0,
+        0,
+        0,
+        (far + near) / (near - far),
+        -1,
+        0,
+        0,
+        (2 * far * near) / (near - far),
+        0,
+      ];
+    }
+    function mesh(vertices, colours, mode) {
+      const buffers = [vertices, colours].map((values) => {
+        const b = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(values), gl.STATIC_DRAW);
+        return b;
+      });
+      return { buffers, count: vertices.length / 3, mode };
+    }
+    function draw(m) {
+      m.buffers.forEach((b, i) => {
+        gl.bindBuffer(gl.ARRAY_BUFFER, b);
+        gl.enableVertexAttribArray(attributes[i]);
+        gl.vertexAttribPointer(attributes[i], 3, gl.FLOAT, false, 0, 0);
+      });
+      gl.drawArrays(m.mode, 0, m.count);
+    }
+    function lines(vertices, colour) {
+      return mesh(
+        vertices,
+        Array.from({ length: vertices.length / 3 }, () => colour).flat(),
+        gl.LINES,
+      );
+    }
+    function destroy(m) {
+      m.buffers.forEach((b) => gl.deleteBuffer(b));
+    }
+    const scene = await fetch("/scene").then((r) => r.json());
+    $("map").textContent = scene.name + " · " + scene.cars + " cars";
+    $("driver").value = scene.policy ? "policy" : "manual";
+    $("driver").options[1].disabled = !scene.policy;
+    for (let i = 0; i < scene.cars; i++) $("car").add(new Option(String(i + 1), String(i)));
+    const road = mesh(scene.vertices, scene.colours, gl.TRIANGLES);
+    function surface(x, y) {
+      const g = scene.grid,
+        ix = Math.round((x - g.x) / g.cell),
+        iy = Math.round((y - g.y) / g.cell);
+      if (ix < 0 || iy < 0 || ix >= g.nx || iy >= g.ny) return { z: 0, sx: 0, sy: 0 };
+      const i = iy * g.nx + ix;
+      return {
+        z: g.height[i] + g.sx[i] * (x - g.x - ix * g.cell) + g.sy[i] * (y - g.y - iy * g.cell),
+        sx: g.sx[i],
+        sy: g.sy[i],
+      };
+    }
+    const routeVertices = [];
+    for (let i = 3; i < scene.route.length + (scene.closed ? 3 : 0); i += 3) {
+      const a = scene.route.slice(i - 3, i),
+        b = scene.route.slice(i % scene.route.length, (i % scene.route.length) + 3);
+      routeVertices.push(...add(a, [0, 0, 0.015]), ...add(b, [0, 0, 0.015]));
+    }
+    const route = lines(routeVertices, [0.33, 0.65, 0.7]);
+    let state = null,
+      paused = false,
+      reset = false,
+      steer = 0,
+      yaw = 0.9,
+      elevation = 0.65,
+      zoom = 1,
+      drag = null,
+      totalResets = 0,
+      totalFinishes = 0;
+    const keys = new Set(),
+      trails = Array.from({ length: scene.cars }, () => []),
+      episodes = Array(scene.cars).fill(-1);
+    function togglePause() {
+      paused = !paused;
+      $("pause").textContent = paused ? "Play" : "Pause";
+    }
+    $("pause").onclick = togglePause;
+    $("reset").onclick = () => {
+      reset = true;
+    };
+    $("step").onclick = () => tick();
+    addEventListener("keydown", (e) => {
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key))
+        e.preventDefault();
+      if (e.target.tagName === "SELECT") return;
+      keys.add(e.key.toLowerCase());
+      if (!e.repeat && e.code === "Space") togglePause();
+      if (e.key.toLowerCase() === "r") reset = true;
+    });
+    addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
+    addEventListener("blur", () => keys.clear());
+    canvas.onpointerdown = (e) => {
+      drag = [e.clientX, e.clientY];
+      canvas.setPointerCapture(e.pointerId);
+      $("camera").value = "orbit";
+    };
+    canvas.onpointermove = (e) => {
+      if (drag) {
+        yaw -= (e.clientX - drag[0]) * 0.006;
+        elevation = Math.max(0.08, Math.min(1.5, elevation + (e.clientY - drag[1]) * 0.006));
+        drag = [e.clientX, e.clientY];
+      }
+    };
+    canvas.onpointerup = () => {
+      drag = null;
+    };
+    canvas.onwheel = (e) => {
+      e.preventDefault();
+      zoom = Math.max(0.3, Math.min(5, zoom * Math.exp(e.deltaY * 0.001)));
+    };
+    function frame(i) {
+      const s = state.slice(i * scene.state, (i + 1) * scene.state),
+        ground = surface(s[0], s[1]),
+        up = unit([-ground.sx, -ground.sy, 1]),
+        f = unit([
+          Math.cos(s[2]),
+          Math.sin(s[2]),
+          ground.sx * Math.cos(s[2]) + ground.sy * Math.sin(s[2]),
+        ]);
+      return { s, up, f, left: cross(up, f), p: [s[0], s[1], ground.z] };
+    }
+    const boxFaces = [
+      [0, 2, 1, 1, 2, 3],
+      [4, 5, 6, 5, 7, 6],
+      [0, 1, 4, 1, 5, 4],
+      [2, 6, 3, 3, 6, 7],
+      [0, 4, 2, 2, 4, 6],
+      [1, 3, 5, 3, 7, 5],
+    ].flat();
+    function box(vertices, colours, p, f, l, u, size, colour) {
+      const corners = Array.from({ length: 8 }, (_, i) =>
+        add(
+          p,
+          add(
+            scale(f, ((i & 1 ? 1 : -1) * size[0]) / 2),
+            add(
+              scale(l, ((i & 2 ? 1 : -1) * size[1]) / 2),
+              scale(u, ((i & 4 ? 1 : -1) * size[2]) / 2),
+            ),
+          ),
+        ),
+      );
+      for (const i of boxFaces) {
+        vertices.push(...corners[i]);
+        colours.push(...colour);
+      }
+    }
+    function cars() {
+      const vertices = [],
+        colours = [];
+      for (let i = 0; i < scene.cars; i++) {
+        const { s, p, f, left, up } = frame(i),
+          selected = i === Number($("car").value);
+        box(
+          vertices,
+          colours,
+          add(p, scale(up, 0.14)),
+          f,
+          left,
+          up,
+          [0.58, 0.32, 0.15],
+          selected ? [0.98, 0.65, 0.27] : [0.31, 0.69, 0.64],
+        );
+        box(
+          vertices,
+          colours,
+          add(add(p, scale(up, 0.235)), scale(f, -0.05)),
+          f,
+          left,
+          up,
+          [0.23, 0.25, 0.08],
+          [0.12, 0.19, 0.23],
+        );
+        for (const x of [-0.1651, 0.1651])
+          for (const y of [-0.185, 0.185]) {
+            const a = x > 0 ? s[6] : 0,
+              wf = add(scale(f, Math.cos(a)), scale(left, Math.sin(a))),
+              wl = cross(up, wf);
+            box(
+              vertices,
+              colours,
+              add(p, add(scale(f, x), add(scale(left, y), scale(up, 0.065)))),
+              wf,
+              wl,
+              up,
+              [0.13, 0.07, 0.13],
+              [0.075, 0.085, 0.1],
+            );
+          }
+      }
+      return mesh(vertices, colours, gl.TRIANGLES);
+    }
+    function render() {
+      const dpr = Math.min(devicePixelRatio, 2);
+      canvas.width = Math.round(innerWidth * dpr);
+      canvas.height = Math.round(innerHeight * dpr);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      let target = scene.centre,
+        eye;
+      if (state && $("camera").value === "follow") {
+        const { p, f } = frame(Number($("car").value));
+        target = add(p, [0, 0, 0.1]);
+        eye = add(target, add(scale(f, -3 * zoom), [0, 0, 2 * zoom]));
+      } else if ($("camera").value === "top") {
+        eye = add(target, [0.01, 0, scene.extent * 0.85 * zoom]);
+      } else {
+        const radius = scene.extent * 1.1 * zoom;
+        eye = add(target, [
+          radius * Math.cos(yaw) * Math.cos(elevation),
+          radius * Math.sin(yaw) * Math.cos(elevation),
+          radius * Math.sin(elevation),
+        ]);
+      }
+      gl.uniformMatrix4fv(
+        vpLocation,
+        false,
+        new Float32Array(multiply(perspective(canvas.width / canvas.height), view(eye, target))),
+      );
+      draw(road);
+      if ($("route").checked) draw(route);
+      if (state) {
+        const m = cars();
+        draw(m);
+        destroy(m);
+        const i = Number($("car").value),
+          { s, p, f } = frame(i),
+          v = [];
+        for (let j = 1; j < trails[i].length; j++) v.push(...trails[i][j - 1], ...trails[i][j]);
+        const trail = lines(v, [0.98, 0.65, 0.27]);
+        draw(trail);
+        destroy(trail);
+        if ($("lidar").checked) {
+          const beams = [];
+          for (let b = 0; b < scene.beams; b++) {
+            const angle = s[2] - Math.PI * 0.75 + (b * Math.PI * 1.5) / (scene.beams - 1),
+              distance = state[scene.cars * scene.state + i * scene.obs + 8 + b] * 10;
+            const x = p[0] + distance * Math.cos(angle),
+              y = p[1] + distance * Math.sin(angle);
+            beams.push(...add(p, [0, 0, 0.07]), x, y, surface(x, y).z + 0.07);
+          }
+          const rays = lines(beams, [0.3, 0.48, 0.55]);
+          draw(rays);
+          destroy(rays);
+        }
+        $("speed").textContent = Math.hypot(s[3], s[4]).toFixed(2) + " m/s";
+        $("grade").textContent =
+          ((Math.asin(f[2]) * 180) / Math.PI).toFixed(1) + "° / " + p[2].toFixed(2) + " m";
+        const a = scene.cars * (scene.state + scene.obs) + i * 2;
+        $("control").textContent =
+          ((s[6] * 180) / Math.PI).toFixed(1) +
+          "° / " +
+          Math.max(-1, Math.min(1, state[a + 1])).toFixed(2);
+        $("reward").textContent = s[12].toFixed(2);
+        $("progress").textContent = s[7].toFixed(1) + " m";
+        $("events").textContent = totalResets + " / " + totalFinishes;
+      }
+      requestAnimationFrame(render);
+    }
+    let busy = false,
+      lastTick = 0;
+    async function tick() {
+      if (busy) return;
+      busy = true;
+      try {
+        const direction =
+          (keys.has("a") || keys.has("arrowleft") ? 1 : 0) -
+          (keys.has("d") || keys.has("arrowright") ? 1 : 0);
+        // Actions are steering rates; return to centre when the keys are released.
+        const selectedSteer = state ? state[Number($("car").value) * scene.state + 6] : 0;
+        steer = direction
+          ? direction * 100
+          : Math.max(-100, Math.min(100, ((-selectedSteer * 60) / 3.2) * 100));
+        const throttle =
+          ((keys.has("w") || keys.has("arrowup") ? 1 : 0) -
+            (keys.has("s") || keys.has("arrowdown") ? 1 : 0)) *
+          100;
+        const response = await fetch("/step", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            steering: steer,
+            throttle,
+            reset,
+            policy: $("driver").value === "policy",
+          }),
+        });
+        reset = false;
+        if (!response.ok) throw Error((await response.json()).error);
+        state = await response.json();
+        for (let i = 0; i < scene.cars; i++) {
+          const { s, p } = frame(i);
+          if (episodes[i] !== s[9]) {
+            trails[i] = [];
+            if (episodes[i] >= 0) totalResets++;
+            episodes[i] = s[9];
+          }
+          trails[i].push(add(p, [0, 0, 0.025]));
+          if (trails[i].length > 240) trails[i].shift();
+          const r = scene.cars * (scene.state + scene.obs + 2) + i * 2 + 1;
+          if (state[r] === 3) totalFinishes++;
+        }
+        $("status").textContent = paused
+          ? "Paused"
+          : $("driver").value === "policy"
+            ? "Policy running"
+            : "Keyboard driving";
+      } catch (e) {
+        paused = true;
+        $("error").textContent = e.message;
+        $("status").textContent = "Simulation stopped";
+      } finally {
+        busy = false;
+      }
+    }
+    async function animate(t) {
+      const rate = Number($("rate").value);
+      if ((!paused || reset) && t - lastTick >= 1000 / (60 * Math.min(rate, 1))) {
+        lastTick = t;
+        for (let i = 0; i < Math.max(1, rate); i++) await tick();
+      }
+      requestAnimationFrame(animate);
+    }
+    await tick();
+    requestAnimationFrame(render);
+    requestAnimationFrame(animate);
+  </script>
+</html>

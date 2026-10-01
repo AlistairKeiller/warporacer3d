@@ -46,8 +46,9 @@ def main(
     record_steps: int = 1800,
     max_active_maps: int = 8,
     switch_map_iter: int = 0,
-    substeps: int = 24,
-    solver_iterations: int = 32,
+    substeps: int = SimConfig.substeps,
+    solver_iterations: int = SimConfig.iterations,
+    use_graph: bool = True,
     rollouts: int = 24,
     lidar_beams: int = 108,
     max_steps: int = 10_000,
@@ -58,6 +59,8 @@ def main(
     wp.init()
     torch.manual_seed(seed)
     dev = wp.get_device(device or None)
+    if dev.is_cuda:
+        torch.set_float32_matmul_precision("high")  # Use TF32 for the policy MLP.
     print(
         f"[device] {dev}; {'GPU physics and learning' if dev.is_cuda else 'CPU debug mode'}"
     )
@@ -72,6 +75,7 @@ def main(
     cfg = SimConfig(
         substeps=substeps,
         iterations=solver_iterations,
+        use_graph=use_graph,
         lidar_beams=lidar_beams,
         max_steps=max_steps,
     )

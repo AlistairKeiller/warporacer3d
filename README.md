@@ -1,161 +1,124 @@
 # warporacer3d
 
-3D racing with Newton rigid-body physics, Warp controls and sensing, and PyTorch
-PPO. Cars have physical wheels, suspension, steering, and full six-degree-of-freedom
-motion. Maps are triangle meshes with authored 3D routes, so ramps, banking,
-bridges, tunnels, and gaps use the same interface. Existing ROS image maps also work.
+Fast racing on **flat roads and ramps**, with simulation and PPO written in Mojo.
+The same kernels run on CPU, Apple Metal, NVIDIA CUDA, or AMD HIP. Python prepares
+static maps and hosts a small browser viewer; it is outside the training loop.
 
-Physics, lidar, race logic, resets, and learning run on an NVIDIA CUDA GPU.
-CPU execution is available for debugging. The defaults favor stable physics over
-throughput: 60 Hz controls, 24 substeps, and 32 XPBD iterations.
+The car is a seven-state dynamic bicycle. Road geometry supplies height, pitch,
+and roll; tire forces, steering response, and gravity supply the motion. Road
+edges and walls end an episode. There is no suspension, jumping, or contact solver.
+This deliberately matches the flat-road/ramp scope.
 
-Run the following commands from the `warporacer3d` directory. The Python package
-remains `warporacer`, so the existing imports still work.
+## Try it
 
-```bash
-# Train on a ramp map; W&B is enabled unless explicitly disabled.
-uv run python main.py maps/3d/ramp.yaml --device cuda:0 --no-use-wandb
+Use Python 3.13 and the pinned Mojo/MAX toolchain:
 
-# Train across maps, rotating the active pool every 20 iterations.
-uv run python main.py maps/3d/ --switch-map-iter 20 --no-use-wandb
-
-# Drive manually: I/K forward/reverse, J/L change steering angle.
-uv run --extra viz python main.py maps/3d/ramp.yaml --interactive --device cpu
-
-# Watch training, or periodically record a separate evaluation car.
-uv run --extra viz python main.py maps/3d/ --live-viewer --no-use-wandb
-uv run --extra viz python main.py maps/3d/ramp.yaml --record-every 20 --no-use-wandb
-
-# Small CPU smoke run; checkpoints go to logs/3d/agent_final.pt.
-uv run python main.py maps/3d/ramp.yaml --device cpu --num-envs 2 --iterations 1 --rollouts 4 --no-use-wandb
+```sh
+uv sync
+uv run python app.py
 ```
 
-Viewer and MP4 recording require the `viz` extra and a working OpenGL context.
-The live viewer displays up to 64 cars on the first active map. Examples in
-`maps/3d/` cover flat roads, ramps, banking, an overpass, and a ramp-gap landing.
-Use `maps/my_map.yaml` or `maps/` for legacy occupancy-image maps.
+The viewer builds the runtime, opens a local browser, and starts the ramp map.
+Drive with **W/S** and **A/D** or the arrow keys. Space pauses; R resets. Select a
+car, change camera, inspect lidar and trails, or advance one step. The panel shows
+speed, grade, height, steering, reward, progress, resets, and finishes. Cars run
+independently, so they can overlap. The viewer uses WebGL without external JS libraries.
 
-## Custom maps
+```sh
+# Flat circuit; force CPU execution (also avoids compiling GPU kernels).
+uv run python app.py maps/3d/flat.yaml --device cpu --cars 1
 
-Use metres, Z up, and counterclockwise triangles when viewed from outside the
-surface. Road tops must face up; give walls and obstacles the sides that cars can
-hit. Mesh contacts and lidar reject back faces. Scene-node transforms in OBJ/GLB
-imports are baked into the geometry; author the assets in metres.
-
-A map YAML names geometry and its driving route:
-
-```yaml
-mesh: road.glb             # OBJ, GLB, or NPZ geometry
-route: route.npz
-closed: true
+# Watch a trained policy. Switch to keyboard driving whenever you like.
+uv run python app.py maps/3d/ramp.yaml --checkpoint build/ramp.wrppo --cars 16
 ```
 
-Geometry NPZ files contain `vertices[N,3]` and integer `triangles[M,3]`. Route NPZ
-files contain `points[N,3]`, optional `up[N,3]` (default world Z), and optional
-`half_width[N]` (default 1.5 metres). An open route needs `closed: false`; a closed
-route must omit the repeated endpoint. Up vectors describe banking and spawn
-orientation. Keep the route on the road surface, with enough segments to describe
-its curvature and provide useful spawn locations.
+## Train, evaluate, benchmark
 
-Parts can distinguish drivable road from obstacles:
+```sh
+uv run python prepare.py maps/3d/ramp.yaml build/ramp.wrmap
+uv run mojo build main.mojo -o build/racer
 
-```yaml
-parts:
-  - mesh: road.glb
-  - mesh: barriers.glb
-    obstacle: true
-route: route.npz
-closed: false
+# 256 cars, 300 PPO iterations, checkpoint saved every 100 iterations and at exit.
+build/racer train build/ramp.wrmap gpu 256 300 build/ramp.wrppo
+build/racer eval build/ramp.wrmap gpu 256 1000 build/ramp.wrppo
+build/racer benchmark build/ramp.wrmap gpu 1024 1000
+
+# Continue training, optionally changing backend and batch size.
+build/racer train build/ramp.wrmap cpu 32 100 build/ramp.wrppo build/ramp.wrppo
 ```
 
-`Route`, `MeshPart`, and `Track` can also be constructed directly in Python.
-`ribbon(route)` generates a solid road from a route; `demo_track()` demonstrates
-ramps, banks, overlapping levels, and disconnected landing geometry. Spawns are
-segment midpoints with four-wheel support checked against the mesh. Invalid
-routes or maps without supported spawns raise an error.
+CLI arguments are `MODE MAP [DEVICE] [CARS] [STEPS_OR_ITERATIONS] [CHECKPOINT] [RESUME]`.
+`DEVICE` is `auto` (the default), `cpu`, or `gpu`; Mojo selects the installed GPU
+backend. A training iteration collects 32 steps per car, then runs four PPO epochs.
+Evaluation uses deterministic actions and reports reward, failures, and finishes.
+Checkpoints include weights, Adam moments, optimizer step, iteration, and RNG seed;
+resuming starts fresh driving episodes. Old Torch checkpoints are incompatible.
 
-Geometry determines contact and sensing; the route determines direction, progress,
-width, and episode completion. A junction can have several map manifests sharing
-one mesh and following different routes. Progress follows nearby route segments
-in arc length and 3D space, preserving the intended branch through crossings.
-There is no generated floor under gaps in mesh maps.
+For a CPU-only binary, including on Macs without the Metal compiler:
 
-## Environment interface
-
-```python
-import torch
-from warporacer.sim import Env, SimConfig
-from warporacer.track import Track
-
-track = Track.load("maps/3d/ramp.yaml")
-env = Env(track, num_envs=256, device="cuda:0", config=SimConfig())
-actions = torch.zeros((env.num_envs, env.act_dim), device=env.torch_device)
-obs, reward, done = env.step(actions)
+```sh
+uv run mojo build main.mojo -D CPU_ONLY=true -o build/racer-cpu
+build/racer-cpu benchmark build/ramp.wrmap cpu 32 1000
 ```
 
-Actions are normalized steering-target rate and forward/reverse motor torque.
-Steering targets have angle and slew limits. Motors have bounded torque and a
-speed curve; body motion follows Newton's dynamics. Wheel friction and motor
-strength vary by ±15% on each reset. Tires use contact friction, with a simple
-linear chassis drag; this is a simplified car rather than a calibrated tire model.
+CPU is usually best for one car. The GPU becomes useful with larger batches.
+Default sensing is 64 planar beams over 270°, with a 10 m range. Compile with
+`-D BEAMS=108 -D RANGE=20` for the original `warporacer` sensor count and range.
+Use the same sensing configuration to train, evaluate, and load checkpoints.
+The browser viewer uses the default configuration.
 
-Default observations have 338 values:
+## Maps
 
-| Indices | Values |
-| --- | --- |
-| `0` | Measured mean front steering angle, radians |
-| `1:4` | Chassis-frame linear velocity, m/s |
-| `4:7` | Chassis-frame angular velocity, rad/s |
-| `7:10` | Unit gravity direction in the chassis frame |
-| `10:14` | Front-left, front-right, rear-left, rear-right contact flags |
-| `14:` | Lidar ranges, metres; three elevation rows of 108 beams |
+`prepare.py` reads the existing YAML/mesh/ROS-image loaders and bakes a 2.5 cm
+height/gradient/clearance grid plus a uniformly sampled route into `.wrmap`.
+Triangle geometry remains available to the viewer. Road edges, holes, and thin
+walls are conservatively rasterized; the chassis uses swept clearance queries.
+Obstacle projections block the entire road column. Overlapping road levels are
+rejected, and ramps must be below about 45°. Existing overpass/jump maps require
+the reference simulator.
 
-`SimConfig` configures lidar mount, elevations, field of view, beam count, and
-range. Every ray follows the complete chassis pose and queries only its map.
-The policy derives its input size from the environment.
+## Performance and portability
 
-Outputs are persistent Torch views over Warp buffers. Copy them when retaining
-history. Finished cars reset automatically, so terminal rewards/dones accompany
-the next episode's initial observation. `env.reason` contains `0` running, `1`
-collision, `2` lost/off-course, `3` prolonged rollover, `4` timeout, or `5` open-route
-finish. Airborne motion is allowed. `env.observe()` does not advance time or RNG;
-`env.reset(mask)` resets selected cars; `env.rotate(tracks)` replaces the map pool
-while preserving output allocations. Map import and model construction run on
-the host; stepping uses device arrays and a shared CUDA stream with PyTorch.
+The local Apple M5 Pro runs both simulation and the entire learner on Metal.
+Measured comparisons, methodology, and differences from the original 2D racer
+and Newton implementation are in [BENCHMARKS.md](BENCHMARKS.md).
 
-The environment owns a Warp blocking stream, shared with Torch during its calls.
-GPU event waits order inputs and outputs with the caller's current Torch stream,
-including non-default streams. This also protects Newton's temporary buffers.
-When reading environment buffers on a new Torch stream before calling an
-environment method, use `with env.scope():` to establish the same ordering.
+The source shares one CPU/GPU implementation; only dispatch and MAX matmul select
+a backend. Apple CPU/Metal are tested here. CUDA, HIP, and Windows/WSL still need
+hardware validation. Mojo currently supports Apple silicon Macs, compatible Linux
+hosts, and Windows through WSL, rather than native Windows. Consult the current
+[Mojo requirements](https://mojolang.org/docs/requirements/) for supported GPUs
+and drivers.
 
-Checkpoints use format version 2 and include policy weights, observation
-normalization, dimensions, and vehicle/simulation configuration. Old 2D policies
-have incompatible observation dimensions.
+This Mac's Metal toolchain is installed and works. On a fresh Mac, install Xcode
+and, if needed, run `xcodebuild -downloadComponent MetalToolchain`.
+[GPU_INVESTIGATION.md](GPU_INVESTIGATION.md) records the platform choices and
+compiler issues encountered.
 
-## Code and checks
+## Read the code / verify it
 
-| Module | Responsibility |
-| --- | --- |
-| `track.py`, `legacy.py` | Mesh/route data, import, procedural roads, image adapter |
-| `vehicle.py` | Car construction and motor controls |
-| `sim.py` | Per-map Newton worlds, GPU episodes, resets, progress, and sensing |
-| `agent.py`, `ppo.py`, `train.py` | Policy, PPO, and CLI |
-| `viewer.py`, `video.py` | Newton viewer and isolated evaluation recordings |
+Start with [racer/vehicle.mojo](racer/vehicle.mojo), then
+[racer/terrain.mojo](racer/terrain.mojo) and [racer/env.mojo](racer/env.mojo).
+[ARCHITECTURE.md](ARCHITECTURE.md) explains the equations, buffer layout, PPO, and
+scope. There is no general physics framework or autodiff framework in the new runtime.
 
-[ARCHITECTURE.md](ARCHITECTURE.md) records the design and the pure Warp comparison.
-Local `../warp` and `../newton` sources served as API references. Runtime packages
-are pinned through `uv.lock`; the source directories are not runtime dependencies.
+```sh
+uv run python -m unittest discover -s tests -p 'test_p*.py'
+uv run python prepare.py maps/3d/flat.yaml build/flat.wrmap
+uv run python prepare.py maps/3d/ramp.yaml build/ramp.wrmap
+uv run mojo -I . tests/test_mojo.mojo build/flat.wrmap build/ramp.wrmap
 
-```bash
-uv run python -m unittest discover -s tests -v
-RACER_DEVICE=cuda:0 uv run python -m unittest discover -s tests -v
+# Optional independent autograd check: Torch is a test/reference dependency.
+uv run --extra reference mojo -I . tests/gradient.mojo cpu build/flat.wrmap build/cpu-gradient.bin
+uv run --extra reference mojo -I . tests/gradient.mojo gpu build/flat.wrmap build/gpu-gradient.bin
+uv run --extra reference python tests/check_gradient.py build/cpu-gradient.bin build/gpu-gradient.bin
+
+# Comparison with the sibling original racer, using its own virtual environment.
+uv run python compare.py --original ../warporacer
+uv run python compare.py --original ../warporacer --cars 256 --train-iterations 10 --output build/training-comparison.json
 ```
 
-The behavior suite covers driving, steering, suspension, slopes, banking,
-takeoff/landing, wall contacts, overpasses, route crossings, resets, map changes,
-mesh import (including integer-overflow rejection), legacy maps, and a PPO update.
-The CUDA test exercises delayed action production and observation/reset reads
-across two Torch streams; it skips when CUDA is unavailable. CPU checks and
-OpenGL recording were run locally on macOS. CUDA execution still needs validation
-on an NVIDIA machine.
+The previous Newton/Warp/Torch runtime remains available via
+`uv run --extra reference python main.py`. Its code and existing tests are retained;
+its [usage](docs/reference/README.md) and
+[architecture](docs/reference/ARCHITECTURE.md) are archived separately.

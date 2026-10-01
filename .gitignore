@@ -16,3 +16,8 @@ wandb/
 # macOS
 .DS_Store
 **/.DS_Store
+
+# Compiled Mojo programs, maps, and checkpoints
+*.wrmap
+*.wrppo
+/racer-bin

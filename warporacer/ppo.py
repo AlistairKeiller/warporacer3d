@@ -63,7 +63,9 @@ class PPO:
                 "Positive rollout dimensions must divide evenly into minibatches"
             )
         self.lr, self.global_step, self.iteration = lr, 0, 0
-        self.opt = torch.optim.Adam(agent.parameters(), lr=lr, eps=1e-5)
+        self.opt = torch.optim.Adam(
+            agent.parameters(), lr=lr, eps=1e-5, fused=env.device.is_cuda
+        )
         self.obs_rms = RunningMeanStd((env.obs_dim,), env.torch_device)
         self.return_rms = RunningMeanStd((), env.torch_device)
         self.returns = torch.zeros(self.N, device=env.torch_device)
@@ -73,6 +75,14 @@ class PPO:
             deque(maxlen=100),
             deque(maxlen=100),
         )
+        shape, dev = (self.T, self.N), env.torch_device
+        self.buffer = (
+            torch.empty((*shape, env.obs_dim), device=dev),
+            torch.empty((*shape, env.act_dim), device=dev),
+            *(torch.empty(shape, device=dev) for _ in range(3)),
+            torch.empty((self.T + 1, self.N), device=dev),
+        )
+        self.episode_stats = torch.empty((*shape, 2), device=dev)
         self.reset_env_stats()
 
     def reset_env_stats(self):
@@ -84,12 +94,7 @@ class PPO:
 
     @torch.no_grad()
     def rollout(self):
-        dev = self.env.torch_device
-        shape = (self.T, self.N)
-        obs = torch.empty((*shape, self.env.obs_dim), device=dev)
-        actions = torch.empty((*shape, self.env.act_dim), device=dev)
-        logp, rewards, dones = (torch.empty(shape, device=dev) for _ in range(3))
-        values = torch.empty((self.T + 1, self.N), device=dev)
+        obs, actions, logp, rewards, dones, values = self.buffer
         for t in range(self.T):
             obs[t] = self.obs
             distribution = self.agent.dist(self.obs)
@@ -105,8 +110,10 @@ class PPO:
             self.ep_return.add_(reward)
             self.ep_length.add_(1)
             finished = done.bool()
-            self.finished_returns.extend(self.ep_return[finished].cpu().tolist())
-            self.finished_lengths.extend(self.ep_length[finished].cpu().tolist())
+            self.episode_stats[t, :, 0] = torch.where(
+                finished, self.ep_return, torch.nan
+            )
+            self.episode_stats[t, :, 1] = self.ep_length
             self.ep_return.mul_(1 - dones[t])
             self.ep_length.mul_(1 - dones[t])
             self.obs_rms.update(raw)
@@ -114,6 +121,11 @@ class PPO:
             if self.env.viewer is not None and t % 10 == 0:
                 self.env.viewer.render()
         values[-1] = self.agent.value(self.obs)
+        # Transfer completed-episode statistics once, rather than blocking each step.
+        stats = self.episode_stats.flatten(0, 1).cpu()
+        completed = stats[torch.isfinite(stats[:, 0])]
+        self.finished_returns.extend(completed[:, 0].tolist())
+        self.finished_lengths.extend(completed[:, 1].tolist())
         advantages = gae(rewards, dones, values)
         returns = advantages + values[:-1]
         return (
@@ -126,6 +138,10 @@ class PPO:
         )
 
     def iterate(self):
+        with self.env.scope():
+            return self._iterate()
+
+    def _iterate(self):
         obs, actions, old_logp, advantage, returns, old_values = self.rollout()
         advantage = (advantage - advantage.mean()) / (
             advantage.std(unbiased=False) + 1e-8
@@ -134,7 +150,7 @@ class PPO:
         updates, stopped = 0, False
         size = self.batch_size // self.minibatches
         for _ in range(self.epochs):
-            epoch_kl = 0.0
+            epoch_kl = torch.zeros((), device=obs.device)
             for ids in torch.randperm(self.batch_size, device=obs.device).split(size):
                 distribution = self.agent.dist(obs[ids])
                 logp = distribution.log_prob(actions[ids]).sum(-1)
@@ -171,9 +187,9 @@ class PPO:
                             fraction,
                         ]
                     )
-                    epoch_kl += float(kl)
+                    epoch_kl.add_(kl)
                 updates += 1
-            if epoch_kl / self.minibatches > 1.5 * TARGET_KL:
+            if float(epoch_kl) / self.minibatches > 1.5 * TARGET_KL:
                 stopped = True
                 break
         policy, value, entropy, kl, fraction = (metrics / updates).tolist()

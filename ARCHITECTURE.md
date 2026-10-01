@@ -1,187 +1,150 @@
-# warporacer3d architecture
+# Mojo racer architecture
 
-Status: implemented from the approved design, with separate front steering and
-axle hinges after testing the compact D6 joint proposal.
+The runtime owns only the flat-road/ramp racing problem. It consists of shared
+scalar vehicle/terrain kernels and a fixed small PPO network. Python imports maps
+once; Mojo owns all simulation and learning state thereafter.
 
-Newton XPBD handles rigid bodies, suspension, wheel contacts, gravity, and
-integration. Warp kernels handle controls, lidar, progress, rewards, and resets.
-PyTorch PPO uses the same CUDA device and stream. Performance tuning is deferred.
+| File | Responsibility |
+| --- | --- |
+| `prepare.py` | Load meshes/images, bake conservative clearance, height, road gradients, route, and spawns |
+| `racer/core.mojo` | Own two device buffers, CPU/GPU dispatch, seeded random numbers, binary reads |
+| `racer/terrain.mojo` | Validate assets, query support, march lidar, project onto a local route window |
+| `racer/vehicle.mojo` | Seven-state bicycle and its surface-relative frame |
+| `racer/env.mojo` | Four substeps, swept chassis checks, reward/termination/reset, observations |
+| `racer/network.mojo` | Arena offsets, initialization, MAX matmul, fixed network forward/backward |
+| `racer/ppo.mojo` | Rollout, GAE, minibatches, clipped losses, gradient clipping, Adam |
+| `racer/checkpoint.mojo` | Versioned model/optimizer checkpoint, atomic replacement |
+| `racer/evaluate.mojo` | Deterministic driving and aggregate metrics |
+| `racer/interactive.mojo` | Local viewer controls and host snapshots |
+| `main.mojo` | Benchmark/train/eval/serve entry point |
+| `app.py`, `ui/viewer.html` | Local HTTP host and dependency-free WebGL viewer |
 
-```mermaid
-flowchart LR
-    Maps[Triangle meshes and 3D routes] --> Physics[Newton XPBD and jointed cars]
-    Maps --> Env[Warp controls, sensing, and race logic]
-    Env <--> Physics
-    Env <--> PPO[PyTorch PPO]
-    Physics --> Viewer[Newton 3D viewer]
-```
+## Vehicle and coordinates
 
-## Pure Warp feasibility
+World coordinates are XYZ, with Z up. The dynamic state is `(x, y, heading, u, v,
+yaw_rate, steering_angle)`. Heading is the azimuth of the forward direction;
+`u`, `v`, and yaw rate are expressed in the road-relative frame. The car weighs
+3 kg, has a 0.3302 m wheelbase, and a 0.58 × 0.38 m chassis.
 
-A compact 3D racer with a rigid chassis and raycast wheels is feasible in pure
-Warp. A local CPU probe exercised mesh selection, ramp normals, overlapping
-levels, closest-point queries, and quaternion transforms. Warp supplies these
-geometry operations, GPU kernels, and Torch interoperability.
+At each substep the map supplies height and road gradients `(sx, sy)`. Normalize
+`(cos(heading), sin(heading), sx*cos(heading)+sy*sin(heading))` for the forward
+axis, and `(-sx, -sy, 1)` for the road normal. Their cross product gives the left
+axis. Gravity contributes `-g*forward.z` and `-g*left.z` to the two velocity
+components; available normal load is `mass*g*normal.z`. This supplies uphill,
+downhill, and cross-slope effects. The browser derives exactly the same pose.
 
-Physical wheels additionally need a joint/contact solver; modern Warp no longer
-ships `warp.sim`. Newton reduces the physics code owned here while allowing
-finite wheels to interact with curbs, ramp edges, walls, and landings. It is built
-on Warp and satisfies the GPU requirement.
+Steering actions command angle rate, bounded to ±3.2 rad/s, with an angle limit
+of ±0.4189 rad. Throttle commands signed motor force, reduced by a simple speed
+curve. Linear tire slip forces use front/rear contact velocities, regularize the
+speed denominator at 0.5 m/s, and saturate at the friction limit. The rear tire
+shares its friction circle between drive and lateral force. Drag dissipates
+forward velocity. Grip and motor strength vary by ±15% on each episode.
 
-| Approach | Code owned by warporacer3d | Vehicle approximation |
-| --- | --- | --- |
-| Pure Warp with raycast wheels | Integration, suspension, grip, chassis collisions, race logic | Support sampled by rays |
-| Newton with raycast wheels | Suspension/grip forces and race logic | Newton chassis, ray-sampled wheels |
-| **Newton with physical wheels** | Car construction, controls, sensing, race logic | Jointed wheels and solver contacts |
+The stiff lateral/yaw pair is solved as a 2×2 implicit linear update before force
+saturation. Four 1/240 s substeps make one 1/60 s action step. Reverse uses the
+same equations, avoiding divisions by signed or zero speed. Convert local yaw
+rate back to azimuth rate using the surface frame. When the road grade changes,
+project the old tangent velocity into the new tangent plane. A sharp transition
+can dissipate energy; this is prescribed road following, without flight or
+suspension dynamics.
 
-## Geometry and routes
+## Geometry and sensing
 
-`Track` contains static triangle `MeshPart`s and an authored `Route`, in metres
-with Z up. Geometry may contain ramps, banks, bridges, tunnels, gaps, and
-obstacles; multiple surfaces may occupy the same XY location. Physics, lidar, and
-rendering use the same geometry. A heightfield cannot represent this contract.
+The offline compiler rasterizes upward-facing road triangles and their planar
+height/gradients. Projected obstacle faces occupy every cell they intersect,
+including zero-width vertical walls. The union of road polygons supplies actual
+boundaries: internal tessellation edges disappear, while even sub-cell road
+holes remain blocked. Overlapping heights at one XY position are rejected.
 
-Route points, up vectors, widths, and an open/closed flag provide direction,
-progress, and spawn frames. A junction can have several manifests sharing one
-mesh and following different routes. There is no road-network planner.
+The clearance field is a Euclidean distance transform to occupied cell centres,
+minus half a cell diagonal. Runtime lookup subtracts the query's displacement
+from the selected cell centre as well. This is a conservative lower bound, so
+sphere tracing cannot step over an occupied wall cell. Lidar has a finite march
+budget and may shorten grazing rays rather than overshoot a barrier. Height uses
+the stored plane, so flat and ramp interiors are not stair-stepped.
 
-YAML manifests reference OBJ/GLB or NPZ geometry and a route NPZ. Trimesh imports
-scene geometry and bakes node transforms. Validation checks finite coordinates,
-integer indices, degeneracy, nonzero route segments, widths, and route frames.
-Authored road triangles must face up and obstacle faces outward: mesh queries and
-Newton contacts reject back faces. Support rays validate spawn frames; the
-importer cannot infer the intended winding of arbitrary open geometry.
+Three circles centred at longitudinal offsets `-0.15, 0, +0.15` m, each of radius
+0.24 m, enclose the rectangular chassis. Sample them before and after every
+substep, inflating by half the maximum centre motion plus 1 mm. This catches thin
+walls and road edges conservatively, including turning. It can reject a near
+miss; there is no bounce or sliding contact response.
 
-The ROS image adapter retains the existing closed-loop centerline extraction,
-then creates a flat road, boundary walls, and a 3D route. Its raster assumptions
-stay in `legacy.py` and the adapter. Procedural flat, ramp, bank, overpass, and
-jump examples use the regular mesh/route interface. Mesh maps have no global
-floor beneath gaps. Concave geometry uses direct triangle/BVH contacts.
+The route is resampled uniformly to at most 0.15 m spacing. Search ±8 segments
+around the previous segment, instead of jumping to a globally nearest segment
+at a crossing. Project progress in 3D arc length, handle closed-route wrapping,
+and bound reward progress by actual distance travelled. Open routes end near
+the final station. Route width also supplies an off-course check.
 
-## Vehicle and controls
+Observations have eight scaled values (steering, forward/lateral velocity, yaw
+rate, longitudinal/lateral gravity direction, normal Z, clearance), followed by
+64 default planar lidar beams. These rays query XY road boundaries/obstacle
+projections; they are not physical horizontal 3D rays. Range is 10 m and FOV 270°.
+Height and orientation are derived from terrain, never integrated independently.
 
-`CarSpec` defines dimensions, masses, wheel radius, suspension travel/gains,
-friction, steering bounds/gains, drive torque, motor speed, and chassis drag.
-`build_car(spec)` returns a Newton builder and named body/joint/shape IDs.
+## Ownership and execution
 
-The car has eleven bodies: a chassis, four suspended carriers, two front
-steering knuckles, and four cylinder wheels. Each carrier has a spring-damper
-prismatic joint; each wheel has an axle hinge. Front knuckles have steering
-hinges. Carrier and knuckle bodies have finite mass/inertia and no collision
-shape. Internal car contacts are filtered explicitly.
+A `Device` owns the terrain buffer and one Float32 arena. The arena begins with
+state `[N,14]`, observations `[N,OBS]`, actions `[N,2]`, and reward/terminal reason
+`[N,2]`. The remaining training regions contain weights, gradients, two Adam
+moments, rollout storage, activations/deltas/transposes, and reduction scratch.
+`Memory` calculates every region in one place. No hot-path allocation stores
+vehicle or rollout state outside these buffers.
 
-The proposed nine-body car used D6 front joints combining steering and rolling.
-The repeated-rotation test exposed ambiguous steering feedback as wheels spun.
-Separate hinges keep the two angles independent. Hinge frames align their local
-X axes with the physical axes, matching XPBD's twist decomposition. Steering
-observations wrap equivalent quaternion angles into the principal interval.
+Each GPU thread integrates one car, including termination and deterministic
+reset. Lidar runs one thread per ray. CPU dispatch calls the identical functions
+through synchronous `parallelize`; no asynchronous closure retains borrowed
+pointers. Only matrix multiplication has a separate CPU/GPU library call. MAX
+owns portable GEMM optimization, so the project has no Metal/CUDA/HIP kernels.
 
-Suspension uses Newton joint stiffness, damping, and travel limits. The rest pose
-includes spring preload to avoid initial wheel penetration. Steering targets are
-bounded and advance once per control step; Newton's implicit finite-gain drives
-follow those targets. Wheel torques are bounded explicitly, since XPBD does not
-implement built-in effort/velocity limits. A torque-speed curve also limits
-free-spinning wheels during jumps. Linear chassis drag models passive losses.
-No controller overwrites chassis velocity or heading. Contacts provide traction;
-pitch, roll, sliding, takeoff, and landing follow from body dynamics. Tires use
-contact friction rather than a calibrated slip or deformable-tire model.
+A normal training step never transfers cars, observations, actions, rollouts,
+weights, or gradients to the host. Eight statistics are read once per iteration;
+checkpoints read the parameter region periodically. The browser deliberately
+uses a separate snapshot path and does not participate in training.
 
-## Ownership, batching, and step order
+## Learning and episodes
 
-Each active map has a private `PhysicsBatch` owning a Newton model, XPBD solver,
-collision pipeline, contacts, control, and two alternating states. Static map
-geometry is shared globally in that model. Cars are replicated into independent
-worlds at the same origin; world filtering prevents inter-car contacts. Mesh
-objects remain alive with their model.
+The default network is `72 → 64 tanh → 64 tanh → (two Gaussian means, value)` plus
+two learned log standard deviations: 9,029 parameters. Explicit derivatives
+cover this fixed network and clipped PPO losses; there is no general autodiff
+system. MAX's fast GPU matmul may use reduced product precision; the gradient
+oracle checks both individual error and relative norm. CPU uses stricter FP32
+checks.
 
-Each batch receives a contiguous slice of environment actions and outputs. This
-supports arbitrary map geometry and part counts without relying on experimental
-heterogeneous-world selection. Map rotation rebuilds physics models and resets
-episodes, preserving the environment's output allocations and Torch views.
+Collect 32 steps/car. Compute GAE with gamma 0.99 and lambda 0.95, normalize
+advantages across the rollout, then train four epochs with four minibatches.
+Two modular shears provide a bijective shuffle for arbitrary batch sizes without
+a shuffle buffer. PPO ratio/value clips are 0.2, value loss weight is 0.5,
+gradient norm limit is 0.5, and Adam uses learning rate 3e-4 and epsilon 1e-5.
+Observations have fixed physical scaling; there are no running RMS buffers or
+adaptive learning-rate machinery. Gaussian samples are stored before actuator
+clamping, so their likelihoods stay consistent.
 
-Newton owns body poses and velocities. `Env` owns steering targets, route and
-episode state, randomization, actions, and outputs. Named IDs resolve bodies,
-shapes, and joints without assuming buffer strides. Newton spatial vectors use
-linear components first, angular components second, in world coordinates.
+Reward is ten times progress in metres, minus a small steering penalty. A road
+or wall failure subtracts two; an open-route finish adds two. Reasons are
+`0=running, 1=collision/unsupported/off-course, 2=time limit, 3=finish`.
+Episodes are explicitly finite at 3,000 steps, so every terminal reason stops
+GAE bootstrapping. A rollout boundary still bootstraps normally. Finished cars
+reset in the same kernel; their terminal reward/reason accompanies the next
+spawn's observation. Viewer episode counters/trails expose these resets.
 
-Each 60 Hz control step:
+Checkpoints store version, network dimensions, lidar range, iteration, optimizer step, full
+32-bit seed, weights, gradients, and Adam moments. Write a temporary file, close
+it, then atomically rename it over the destination. They can move between batch
+sizes and backends; resume starts fresh simulation episodes. Sensor dimensions
+and range must match. Assets and checkpoints are validated before entering pointer kernels.
 
-1. Advance the steering target once.
-2. For each of 24 substeps, clear external forces, apply motor controls, collide,
-   accumulate crash events, run 32 XPBD iterations, and swap state buffers.
-3. Calculate progress, reward, and terminal reason.
-4. Reset finished cars on the device, including every body, velocity, force,
-   steering control, route reference, episode clock, and randomization state.
-5. Observe the resulting or newly spawned poses.
+## Deliberate limits and validation
 
-The initial 12-substep/8-iteration settings produced unstable rolling; defaults
-were increased after the drive tests. Timestep convergence is checked at rest.
-Contacts are discrete; thin-wall tests cover the intended motor-speed range.
-Chassis impacts, obstacles, prolonged rollover, falling/off-course motion,
-timeouts, and open-route completion end episodes. Brief loss of wheel support
-is allowed. `observe()` does not advance physics, episode clocks, or RNG. Readers
-of Newton's bodies must resolve the current state after each buffer swap.
+This model stays attached to the road at a crest. It does not simulate wheels,
+vertical acceleration, jumps, suspension, collision response, deformable terrain,
+overpasses, or car-to-car collisions. Use the retained Newton implementation for
+those tasks. Tire constants are a compact racing approximation, not a calibrated
+replacement for CommonRoad's passenger-car MB model.
 
-## Progress, sensing, and learning
-
-Projection chooses the nearest 3D route segment within an arc-length window
-around previous progress. Signed reward progress is bounded by physical travel;
-only closed routes wrap. This retains the intended branch through self-crossings
-and overpasses. Reverse travel produces negative progress, and respawns reset
-the progress reference. Lateral width checks are independent of height, allowing
-intended jumps.
-
-Observations contain measured steering, chassis-frame linear/angular velocity,
-projected gravity, four wheel-contact flags, and configurable 3D lidar ranges.
-Every sensor mount and ray uses the full chassis transform. Rays query only the
-selected map; misses return maximum range. Default lidar has three elevation
-rows of 108 beams; the complete observation has 338 values.
-
-`Agent` and `PPO` derive dimensions from `Env`. Ordinary Torch operations implement
-rollouts, normalization, GAE, and clipped updates. Outputs use zero-copy Torch
-views, with Warp and Torch environment operations using one Warp-owned blocking
-CUDA stream. GPU event waits order that stream with the caller's current Torch
-stream on entry and exit. This permits calls from different Torch streams and
-protects temporary buffers allocated inside Newton. `Env.scope()` exposes the
-same ordering for consumers of the environment's buffers. Host work is limited
-to construction/import, viewer input/rendering, logging, and video encoding.
-Version-2 checkpoints include dimensions, normalization, and configurations.
-
-The optional Newton ViewerGL wrapper displays actual chassis and wheel poses.
-Recording creates a separate evaluation environment, preserving training state
-and reset RNG. Headless recording requires an OpenGL context.
-
-## Dependencies and validation
-
-Runtime uses Newton 1.6.0, Warp 1.17.0, and Trimesh 4.12.2 through `uv.lock`, plus
-the existing Torch/scientific dependencies. Viewer dependencies are the optional
-`viz` extra (`pyglet`, `imgui_bundle`); XPBD does not need MuJoCo. Local `../warp`
-and `../newton` checkouts are references, not runtime path dependencies.
-
-Behavior checks cover rest equilibrium, steering through repeated wheel turns,
-forward/reverse drive, world isolation, slope gravity, banking, air/landing,
-wall impacts, 3D lidar levels and orientation, route crossings/wrapping, open
-completion, seeded selective resets, stable map-swap output views, mesh import,
-legacy maps, and a PPO update. OpenGL rendering and MP4 recording were exercised;
-recording was checked to leave training poses, clocks, observations, and reset
-counts unchanged. Mesh-index tests reject values before narrowing to int32, so
-overflowing indices cannot alias valid vertices. A CUDA-only test checks inputs,
-observations, and resets across two non-default Torch streams, with delayed input
-production to expose missing dependencies. Tests run on CPU here; CUDA residence
-and execution require running the same suite on an NVIDIA machine. This Mac has
-no Warp GPU device.
-
-## Local references
-
-- `../warp`: mesh/raycast examples, runtime geometry documentation, rendering,
-  and Torch interoperability.
-- `../newton/newton/examples/basic/example_basic_shapes.py`: XPBD, collisions,
-  state swapping, and viewer integration.
-- `../newton/newton/examples/basic/example_basic_joints.py`: joint construction.
-- `../newton/newton/examples/robot/example_robot_omniwheel.py`: wheel construction
-  and motor controls; its solver choice is not copied.
-- `../newton/docs/concepts/worlds.rst`, `collisions.rst`, `conventions.rst`: world
-  isolation, mesh contacts, and state conventions.
-- `../newton/newton/_src/solvers/xpbd/solver_xpbd.py`: supported joints/drives and
-  limitations. The local source snapshot is newer than the pinned release; the
-  installed release's APIs were also inspected and executed.
+Behavior checks cover rest, drive/coast/reverse, slope gravity, orthonormal
+frames, shuffling, CPU/Metal parity on flat/ramp maps, pure sensing, selective
+reset/time limits, GAE episode boundaries, and cross-device checkpoints. Geometry
+checks cover bridges, invalid assets, out-of-road routes, and sub-cell walls.
+An independent Torch autograd oracle checks every PPO/network derivative.
+Longer training and deterministic evaluation establish that the model learns
+rather than merely running quickly. The previous Python tests still pass.

@@ -7,6 +7,8 @@ import newton
 import numpy as np
 import warp as wp
 
+wp.set_module_options({"enable_backward": False})
+
 
 @dataclass(frozen=True)
 class CarSpec:

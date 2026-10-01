@@ -1,0 +1,280 @@
+{
+  "date": "2026-10-01",
+  "hardware": "Apple M5 Pro, 18 CPU cores, 20 GPU cores, 48 GB",
+  "mojo": "1.1.0",
+  "max": "26.6.0",
+  "step": {
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "steps": 1000,
+    "repeats": 3,
+    "mode": "step",
+    "train_iterations": 0,
+    "results": [
+      {
+        "runtime": "warporacer",
+        "device": "cpu + mps",
+        "cars": 1,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.7900579159613699,
+        "transitions_s": 1265.7299924438644
+      },
+      {
+        "runtime": "warporacer",
+        "device": "cpu + mps",
+        "cars": 32,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 1.8084933329373598,
+        "transitions_s": 17694.286960972928
+      },
+      {
+        "runtime": "warporacer",
+        "device": "cpu + mps",
+        "cars": 128,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 4.948305999976583,
+        "transitions_s": 25867.4382709165
+      },
+      {
+        "runtime": "warporacer",
+        "device": "cpu + mps",
+        "cars": 1024,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 30.768062000046484,
+        "transitions_s": 33281.26418876993
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 1,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 0.005566000007092953,
+        "transitions_s": 179662.23476925338
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 32,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 0.10562500008381903,
+        "transitions_s": 302958.57964124315
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 128,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 0.40722299995832145,
+        "transitions_s": 314324.09272831
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 1024,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 1.1666719999630004,
+        "transitions_s": 877710.2733523003
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 1,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 0.07432799995876849,
+        "transitions_s": 13453.880106483746
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 32,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 0.08376900013536215,
+        "transitions_s": 382002.8882795696
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 128,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 0.08256000000983477,
+        "transitions_s": 1550387.5967145385
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 1024,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 0.15681799990125,
+        "transitions_s": 6529862.647430932
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 1,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.011514999903738499,
+        "transitions_s": 86843.24866345302
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 32,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.1511959999334067,
+        "transitions_s": 211645.81082895177
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 128,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.41729000001214445,
+        "transitions_s": 306741.11528259673
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 1024,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 1.881082999985665,
+        "transitions_s": 544367.2607789255
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 1,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.07535300008021295,
+        "transitions_s": 13270.871749439362
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 32,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.08428800012916327,
+        "transitions_s": 379650.7207545923
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 128,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.08831000002101064,
+        "transitions_s": 1449439.4742333412
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 1024,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 0.2085589999333024,
+        "transitions_s": 4909881.617803486
+      }
+    ],
+    "mojo_state_floats": 14
+  },
+  "training": {
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "steps": 300,
+    "repeats": 3,
+    "mode": "train",
+    "train_iterations": 10,
+    "results": [
+      {
+        "runtime": "warporacer",
+        "device": "cpu + mps",
+        "cars": 256,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 283.9059834019281,
+        "transitions_s": 21640.96693693802
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 256,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 58.54279999621212,
+        "transitions_s": 139931.8105818315
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 256,
+        "beams": 64,
+        "range": 10,
+        "step_ms": 36.12449998036027,
+        "transitions_s": 226771.3049164342
+      },
+      {
+        "runtime": "mojo",
+        "device": "cpu",
+        "cars": 256,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 64.23159998375922,
+        "transitions_s": 127538.47019335224
+      },
+      {
+        "runtime": "mojo",
+        "device": "gpu",
+        "cars": 256,
+        "beams": 108,
+        "range": 20,
+        "step_ms": 36.556400009430945,
+        "transitions_s": 224092.08778453566
+      }
+    ],
+    "mojo_state_floats": 14
+  },
+  "newton": [
+    {
+      "device": "cpu",
+      "num_envs": 1,
+      "substeps": 16,
+      "iterations": 12,
+      "use_graph": true,
+      "step_ms": 2.0692555660692356,
+      "env_steps_per_second": 483.2655842021502
+    },
+    {
+      "device": "cpu",
+      "num_envs": 32,
+      "substeps": 16,
+      "iterations": 12,
+      "use_graph": true,
+      "step_ms": 38.37989723154654,
+      "env_steps_per_second": 833.7698198341565
+    },
+    {
+      "device": "cpu",
+      "num_envs": 128,
+      "substeps": 16,
+      "iterations": 12,
+      "use_graph": true,
+      "step_ms": 151.68779166415334,
+      "env_steps_per_second": 843.8385093205151
+    }
+  ]
+}
