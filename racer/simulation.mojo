@@ -1,30 +1,46 @@
-"""Fused integration, terminal/reset logic, and parallel distance-field lidar."""
-from std.math import sqrt
-from .device import Ptr, Params, clamp, uniform
+"""One fused environment step: policy, sampling, dynamics, resets, and lidar.
+
+On the GPU each environment is one thread block: the block evaluates the
+policy cooperatively, thread 0 samples and integrates, then every thread
+casts one lidar ray. The CPU runs the same phases as loops per environment.
+"""
+from std.math import sqrt, exp, log
+from std.memory import unsafe_stack_allocation, AddressSpace
+from max.gpu import block_idx, thread_idx
+from max.gpu.sync import barrier
+from .device import Ptr, Params, clamp, uniform, normal, LANES
+from .layout import (
+    RAYS,
+    STATE,
+    OBS,
+    IN,
+    H,
+    HA,
+    OUT,
+    W0,
+    W1,
+    W2,
+    LOGSTD,
+    ROLLOUT,
+    obs_offset,
+    action_offset,
+    reward_offset,
+    stats_offset,
+    memory,
+)
 from .terrain import surface, progress
-from .lidar import RAYS, RANGE, ray, mount, direction
+from .lidar import RANGE, ray, mount, direction
 from .vehicle import Car, frame, integrate
+from .network import hidden, dot, row_hidden
 
-comptime OBS = 8 + RAYS
-comptime STATE = 14
-# Arena begins with state[N,14], observation[N,OBS], actions[N,2], rewards[N,2].
-# State: x,y,heading,u,v,yaw,steer,progress,steps,episode,grip,motor,return,route segment.
-
-
-def obs_offset(n: Int) -> Int:
-    return n * STATE
-
-
-def action_offset(n: Int) -> Int:
-    return n * (STATE + OBS)
-
-
-def reward_offset(n: Int) -> Int:
-    return n * (STATE + OBS + 2)
-
-
-def env_size(n: Int) -> Int:
-    return n * (STATE + OBS + 4)
+comptime THREADS = H
+# Step flags (Params.flag).
+comptime POLICY = 1  # evaluate the network and sample actions
+comptime DETERMINISTIC = 2  # use the action mean
+comptime RECORD = 4  # store the transition at rollout step Params.offset
+comptime VALUE_ONLY = 8  # only bootstrap the critic (no dynamics or lidar)
+comptime EVAL = 16  # accumulate per-car reward, failures, and finishes
+comptime SENSE_ONLY = 32  # refresh observations without stepping
 
 
 def spawn(i: Int, data: Ptr, map: Ptr, p: Params):
@@ -38,10 +54,12 @@ def spawn(i: Int, data: Ptr, map: Ptr, p: Params):
     var s = route + segment * 10
     for j in range(STATE):
         data[unsafe_offset=k + j] = 0
-    var x = map[unsafe_offset=s] + 0.5 * map[unsafe_offset=s + 3]
-    var y = map[unsafe_offset=s + 1] + 0.5 * map[unsafe_offset=s + 4]
-    data[unsafe_offset=k] = x
-    data[unsafe_offset=k + 1] = y
+    data[unsafe_offset=k] = (
+        map[unsafe_offset=s] + 0.5 * map[unsafe_offset=s + 3]
+    )
+    data[unsafe_offset=k + 1] = (
+        map[unsafe_offset=s + 1] + 0.5 * map[unsafe_offset=s + 4]
+    )
     data[unsafe_offset=k + 2] = map[unsafe_offset=s + 9]
     data[unsafe_offset=k + 7] = (
         map[unsafe_offset=s + 7] + 0.5 * map[unsafe_offset=s + 6]
@@ -52,7 +70,8 @@ def spawn(i: Int, data: Ptr, map: Ptr, p: Params):
     data[unsafe_offset=k + 11] = 0.85 + 0.3 * uniform(seed + 2)
 
 
-def step(i: Int, data: Ptr, map: Ptr, p: Params):
+def advance(i: Int, data: Ptr, map: Ptr, p: Params):
+    """Four 240 Hz substeps, progress reward, terminal checks, and respawn."""
     var n = Int(p.envs)
     var k = i * STATE
     var action = action_offset(n) + i * 2
@@ -117,7 +136,6 @@ def step(i: Int, data: Ptr, map: Ptr, p: Params):
         if clearance < 0.24 + 0.5 * travel + 0.001:
             reason = 1
             break
-    var ground = surface(map, car.x, car.y)
     var projection = progress(
         map, car.x, car.y, Int32(data[unsafe_offset=k + 13])
     )
@@ -160,12 +178,10 @@ def step(i: Int, data: Ptr, map: Ptr, p: Params):
         spawn(i, data, map, p)
 
 
-def observe(i: Int, data: Ptr, map: Ptr, p: Params):
-    var n = Int(p.envs)
-    var env = i // RAYS
-    var beam = i % RAYS
-    var k = env * STATE
-    var o = obs_offset(n) + env * OBS
+def sense(i: Int, beam: Int, data: Ptr, map: Ptr, n: Int):
+    """One lidar ray of car i; beam 0 also writes the proprioceptive inputs."""
+    var k = i * STATE
+    var o = obs_offset(n) + i * IN
     var x = data[unsafe_offset=k]
     var y = data[unsafe_offset=k + 1]
     var heading = data[unsafe_offset=k + 2]
@@ -183,3 +199,148 @@ def observe(i: Int, data: Ptr, map: Ptr, p: Params):
     data[unsafe_offset=o + 8 + beam] = (
         ray(map, mount(x, y, ground.height, f), direction(beam, f)) / RANGE
     )
+
+
+@inline(.always)
+def feature(k: Int, i: Int, data: Ptr, n: Int) -> Float32:
+    """Network input k of car i: clamped observation, then 1, then zeros."""
+    if k < OBS:
+        return clamp(data[unsafe_offset=obs_offset(n) + i * IN + k], -10, 10)
+    return 1 if k == OBS else 0
+
+
+def sample(
+    i: Int, output: Pointer[Float32, _, address_space=_], data: Ptr, p: Params
+):
+    """Draw car i's action from the policy output (or bootstrap its value)."""
+    var n = Int(p.envs)
+    var mem = memory(n)
+    var index = Int(p.offset) * n + i
+    if p.flag & VALUE_ONLY:
+        data[unsafe_offset=mem.values + ROLLOUT * n + i] = output[
+            unsafe_offset=2
+        ]
+        return
+    var probability: Float32 = 0
+    for action in range(2):
+        var std = exp(data[unsafe_offset=mem.weights + LOGSTD + action])
+        var noise = normal(
+            p.seed
+            + UInt32(Int(p.index) * n + i) * 0x9E3779B9
+            + UInt32(action) * 0x85EBCA6B
+        )
+        noise = 0 if p.flag & DETERMINISTIC else noise
+        var value = output[unsafe_offset=action] + std * noise
+        data[unsafe_offset=action_offset(n) + i * 2 + action] = value
+        if p.flag & RECORD:
+            data[unsafe_offset=mem.actions + index * 2 + action] = value
+        probability -= 0.5 * noise * noise + log(std) + 0.918938533
+    if p.flag & RECORD:
+        data[unsafe_offset=mem.logp + index] = probability
+        data[unsafe_offset=mem.values + index] = output[unsafe_offset=2]
+
+
+def policy_gpu(data: Ptr, map: Ptr, p: Params):
+    """One block of H threads per car: cooperative MLP, then thread 0 samples.
+    """
+    var i = block_idx.x
+    var t = thread_idx.x
+    var n = Int(p.envs)
+    var mem = memory(n)
+    var xs = unsafe_stack_allocation[
+        IN, DType.float32, address_space=AddressSpace.SHARED
+    ]()
+    var h1 = unsafe_stack_allocation[
+        HA, DType.float32, address_space=AddressSpace.SHARED
+    ]()
+    var h2 = unsafe_stack_allocation[
+        HA, DType.float32, address_space=AddressSpace.SHARED
+    ]()
+    var output = unsafe_stack_allocation[
+        OUT, DType.float32, address_space=AddressSpace.SHARED
+    ]()
+    for k in range(t, IN, H):
+        var value = feature(k, i, data, n)
+        xs[unsafe_offset=k] = value
+        if p.flag & RECORD:
+            data[
+                unsafe_offset=mem.obs + (Int(p.offset) * n + i) * IN + k
+            ] = value
+    if t >= H - 16:
+        h1[unsafe_offset=t + 16] = 1 if t == H - 16 else 0
+        h2[unsafe_offset=t + 16] = 1 if t == H - 16 else 0
+    barrier()
+    h1[unsafe_offset=t] = hidden[1](
+        t, xs, data.unsafe_offset(mem.weights + W0), IN
+    )
+    barrier()
+    h2[unsafe_offset=t] = hidden[1](
+        t, h1, data.unsafe_offset(mem.weights + W1), HA
+    )
+    barrier()
+    if t < OUT:
+        output[unsafe_offset=t] = dot[1](
+            h2, data.unsafe_offset(mem.weights + W2 + t * HA), HA
+        )
+    barrier()
+    if t == 0:
+        sample(i, output, data, p)
+
+
+def physics(i: Int, data: Ptr, map: Ptr, p: Params):
+    """Integrate car i from the action buffer and record the transition."""
+    var n = Int(p.envs)
+    var mem = memory(n)
+    advance(i, data, map, p)
+    var reward = data[unsafe_offset=reward_offset(n) + i * 2]
+    var reason = data[unsafe_offset=reward_offset(n) + i * 2 + 1]
+    if p.flag & RECORD:
+        var index = Int(p.offset) * n + i
+        data[unsafe_offset=mem.rewards + index] = reward
+        data[unsafe_offset=mem.done + index] = 1 if reason > 0 else 0
+    if p.flag & EVAL:
+        var stats = stats_offset(n) + i * 3
+        data[unsafe_offset=stats] += reward
+        if reason == 1:
+            data[unsafe_offset=stats + 1] += 1
+        elif reason == 3:
+            data[unsafe_offset=stats + 2] += 1
+
+
+def lidar(r: Int, data: Ptr, map: Ptr, p: Params):
+    sense(r // RAYS, r % RAYS, data, map, Int(p.envs))
+
+
+def rollout_cpu(i: Int, data: Ptr, map: Ptr, p: Params):
+    var n = Int(p.envs)
+    var mem = memory(n)
+    var xs = unsafe_stack_allocation[IN, DType.float32]()
+    var h1 = unsafe_stack_allocation[HA, DType.float32]()
+    var h2 = unsafe_stack_allocation[HA, DType.float32]()
+    var output = unsafe_stack_allocation[OUT, DType.float32]()
+    if p.flag & (POLICY | VALUE_ONLY):
+        for k in range(IN):
+            var value = feature(k, i, data, n)
+            xs[unsafe_offset=k] = value
+            if p.flag & RECORD:
+                data[
+                    unsafe_offset=mem.obs + (Int(p.offset) * n + i) * IN + k
+                ] = value
+        row_hidden(xs, data.unsafe_offset(mem.weights + W0), IN, h1)
+        for j in range(H, HA):
+            h1[unsafe_offset=j] = 1 if j == H else 0
+        row_hidden(h1, data.unsafe_offset(mem.weights + W1), HA, h2)
+        for j in range(H, HA):
+            h2[unsafe_offset=j] = 1 if j == H else 0
+        for j in range(OUT):
+            output[unsafe_offset=j] = dot[LANES](
+                h2, data.unsafe_offset(mem.weights + W2 + j * HA), HA
+            )
+    if p.flag & (POLICY | VALUE_ONLY):
+        sample(i, output, data, p)
+    if p.flag & VALUE_ONLY:
+        return
+    if not (p.flag & SENSE_ONLY):
+        physics(i, data, map, p)
+    for beam in range(RAYS):
+        sense(i, beam, data, map, n)

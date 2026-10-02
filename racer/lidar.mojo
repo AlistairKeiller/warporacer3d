@@ -1,11 +1,10 @@
+"""Parallel distance lidar: a BVH ray cast per beam over the map triangles."""
 from std.math import cos, sin
 from std.sys import get_defined_int
 from .device import Ptr
+from .layout import BEAMS, ROWS, RAYS
 from .vehicle import Frame
 
-comptime BEAMS = get_defined_int["BEAMS", 64]()
-comptime ROWS = 3
-comptime RAYS = ROWS * BEAMS
 comptime RANGE = Float32(get_defined_int["RANGE", 10]())
 comptime ELEVATION = Float32(0.261799388)
 comptime MOUNT_FORWARD = Float32(0.2)

@@ -1,17 +1,19 @@
 [project]
 name = "warporacer3d"
-version = "0.1.0"
-description = "Cross-platform Mojo racing with terrain-following dynamics and PPO"
+version = "0.2.0"
+description = "Mojo racing simulation with terrain-following dynamics, lidar, and PPO"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "mojo==1.1.0",
     "max==26.6.0",
-    "numpy>=2.4.4",
-    "pillow>=12",
-    "pyyaml>=6.0.3",
-    "scikit-image>=0.26.0",
-    "scipy>=1.17.1",
-    "shapely>=2,<3",
-    "trimesh>=4.6,<5",
 ]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+warporacer3d = { path = ".", editable = true }
+
+[tool.pixi.tasks]

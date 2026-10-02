@@ -271,7 +271,48 @@
         existing,
       );
     }
-    const scene = await fetch("/scene").then((r) => r.json());
+    function buildScene(d, info) {
+      // Decode the raw .wrmap: header, distance/height/slope grids, route
+      // segments, spawn table, BVH nodes, and triangles (a, b - a, c - a).
+      const nx = d[2], ny = d[3], count = d[4], cells = nx * ny;
+      const segments = 16 + 4 * cells, spawns = segments + 10 * count;
+      const tree = spawns + d[10], triangles = tree + 9 * d[11], total = d[12];
+      const vertices = new Float32Array(total * 9), colours = new Float32Array(total * 9);
+      const light = [0.3, -0.4, 0.86], lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (let t = 0; t < total; t++) {
+        const o = triangles + t * 9;
+        const a = [d[o], d[o + 1], d[o + 2]], e1 = [d[o + 3], d[o + 4], d[o + 5]], e2 = [d[o + 6], d[o + 7], d[o + 8]];
+        const normal = unit(cross(e1, e2)), wall = Math.abs(normal[2]) < 0.1;
+        const shade = 0.65 + 0.35 * Math.abs(dot(normal, light));
+        const colour = (wall ? [0.65, 0.25, 0.18] : [0.29, 0.36, 0.39]).map((c) => c * shade);
+        [a, add(a, e1), add(a, e2)].forEach((v, i) => {
+          vertices.set(v, t * 9 + i * 3);
+          colours.set(colour, t * 9 + i * 3);
+          for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], v[k]); hi[k] = Math.max(hi[k], v[k]); }
+        });
+      }
+      const route = [];
+      for (let i = 0; i < count; i++) route.push(d[segments + i * 10], d[segments + i * 10 + 1], d[segments + i * 10 + 2]);
+      return {
+        ...info,
+        vertices,
+        colours,
+        route,
+        closed: d[5] > 0,
+        centre: [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2],
+        extent: Math.max(hi[0] - lo[0], hi[1] - lo[1]),
+        grid: {
+          nx, ny, x: d[6], y: d[7], cell: d[8],
+          height: d.subarray(16 + cells, 16 + 2 * cells),
+          sx: d.subarray(16 + 2 * cells, 16 + 3 * cells),
+          sy: d.subarray(16 + 3 * cells, 16 + 4 * cells),
+        },
+      };
+    }
+    const scene = buildScene(
+      new Float32Array(await fetch("/map").then((r) => r.arrayBuffer())),
+      await fetch("/info").then((r) => r.json()),
+    );
     $("map").textContent = scene.name + " · " + scene.cars + " cars";
     $("driver").value = scene.policy ? "policy" : "manual";
     $("driver").options[1].disabled = !scene.policy;
@@ -522,17 +563,12 @@
           100;
         const response = await fetch("/step", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            steering: steer,
-            throttle,
-            reset,
-            policy: $("driver").value === "policy",
-          }),
+          headers: { "Content-Type": "text/plain" },
+          body: `${Math.round(steer)} ${throttle} ${reset ? 1 : 0} ${$("driver").value === "policy" ? 1 : 0}`,
         });
         reset = false;
-        if (!response.ok) throw Error((await response.json()).error);
-        state = await response.json();
+        if (!response.ok) throw Error(await response.text());
+        state = new Float32Array(await response.arrayBuffer());
         for (let i = 0; i < scene.cars; i++) {
           const { s, p } = frame(i);
           if (episodes[i] !== s[9]) {
