@@ -1,229 +1,113 @@
-"""One CPU/GPU dispatch path; every kernel shares the same scalar equations."""
+"""One device abstraction for the CPU and every GPU MAX supports.
+
+Buffers are flat float32 device memory; `mat` views them as row-major
+matrices with a static row count. Kernels are closures run per element by
+MAX's `elementwise`; matrix products go through MAX's `matmul`.
+"""
+from std.sys import has_accelerator, get_defined_bool
+from layout import TileTensor, Coord, Idx, row_major, ComptimeInt
+from layout.tile_layout import RowMajorLayout
+from linalg.matmul import matmul
+from linalg.utils import elementwise_compute_lambda_type
+from max.algorithm.functional import elementwise
 from max.gpu.host import DeviceContext, DeviceBuffer
-from max.gpu import global_idx, block_idx, thread_idx
-from max.algorithm import parallelize
-from std.builtin.device_passable import DevicePassable, DeviceTypeEncoder
-from std.math import sqrt, log, cos
-from std.sys import has_accelerator, get_defined_bool, num_physical_cores
 
 comptime GPU_AVAILABLE = has_accelerator() and not get_defined_bool[
     "CPU_ONLY", False
 ]()
-
-comptime Ptr = Pointer[Float32, MutAnyOrigin]
-comptime Vec[width: Int] = SIMD[DType.float32, width]
-# CPU kernels vectorize across this many lanes; GPU threads use one lane.
-comptime LANES = 16
-
-
-struct Params(DevicePassable, TrivialRegisterPassable):
-    comptime device_type = Self
-
-    def _to_device_type(
-        self, mut encoder: Some[DeviceTypeEncoder], target: MutOpaquePointer[_]
-    ):
-        target.unsafe_bitcast[Self]().write(self)
-
-    @staticmethod
-    def get_type_name() -> String:
-        return "Params"
-
-    var envs: Int32
-    var seed: UInt32
-    var offset: Int32
-    var index: Int32
-    var flag: Int32
-    var scale: Float32
-
-    def __init__(
-        out self,
-        envs: Int32,
-        seed: UInt32,
-        offset: Int32 = 0,
-        index: Int32 = 0,
-        flag: Int32 = 0,
-        scale: Float32 = 0,
-    ):
-        self.envs, self.seed, self.offset, self.index, self.flag, self.scale = (
-            envs,
-            seed,
-            offset,
-            index,
-            flag,
-            scale,
-        )
+comptime Buffer = DeviceBuffer[DType.float32]
+comptime Mat[rows: Int] = TileTensor[
+    DType.float32, RowMajorLayout[ComptimeInt[rows], Int], MutAnyOrigin
+]
+comptime Kernel = ImplicitlyCopyable & RegisterPassable & def[
+    width: Int, alignment: Int = 1
+](Coord) -> None
+comptime Epilogue = Optional[elementwise_compute_lambda_type]
 
 
-comptime Body = def(Int, Ptr, Ptr, Params) thin -> None
-comptime VecBody[width: Int] = def[width: Int](
-    Int, Ptr, Ptr, Params
-) thin -> None
-
-
-def gpu_kernel[body: Body](data: Ptr, terrain: Ptr, p: Params, count: Int32):
-    var i = global_idx.x
-    if i < Int(count):
-        body(i, data, terrain, p)
-
-
-def gpu_lane_kernel[
-    body: def[width: Int](Int, Ptr, Ptr, Params) thin -> None
-](data: Ptr, terrain: Ptr, p: Params, count: Int32):
-    var i = global_idx.x
-    if i < Int(count):
-        body[1](i, data, terrain, p)
+def mat[rows: Int](mut buffer: Buffer, cols: Int, offset: Int = 0) -> Mat[rows]:
+    """A `rows` x `cols` row-major view starting `offset` floats into `buffer`."""
+    return TileTensor(
+        ptr=buffer.unsafe_ptr()
+        .unsafe_origin_cast[MutAnyOrigin]()
+        .unsafe_offset(offset),
+        layout=row_major(Coord(Idx[rows], cols)),
+    )
 
 
 struct Device(Movable):
     var ctx: DeviceContext
     var gpu: Bool
-    var data: DeviceBuffer[DType.float32]
-    var terrain: DeviceBuffer[DType.float32]
 
-    def __init__(
-        out self, gpu: Bool, size: Int, map_data: List[Float32]
-    ) raises:
-        self.gpu = gpu
+    def __init__(out self, gpu: Bool) raises:
         comptime if GPU_AVAILABLE:
             self.ctx = DeviceContext() if gpu else DeviceContext(api="cpu")
         else:
             if gpu:
-                raise Error(
-                    "GPU support is unavailable in this build; select cpu"
-                )
+                raise Error("GPU support is unavailable in this build; use cpu")
             self.ctx = DeviceContext(api="cpu")
-        self.data = self.ctx.enqueue_create_buffer[DType.float32](size)
-        self.terrain = self.ctx.enqueue_create_buffer[DType.float32](
-            len(map_data)
-        )
-        self.data.enqueue_fill(0)
-        self.ctx.enqueue_copy(self.terrain, map_data.unsafe_ptr())
+        self.gpu = gpu
+
+    def alloc(self, count: Int) raises -> Buffer:
+        """A zeroed buffer. The fill is waited for: on the CPU, kernels run on
+        the calling thread and would otherwise race the queued fill."""
+        var buffer = self.ctx.enqueue_create_buffer[DType.float32](count)
+        buffer.enqueue_fill(0)
         self.ctx.synchronize()
+        return buffer^
 
-    def pointers(mut self) -> Tuple[Ptr, Ptr]:
-        return (
-            self.data.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
-            self.terrain.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
-        )
-
-    def run[body: Body](mut self, count: Int, p: Params) raises:
-        """Call `body(i)` for every `i < count`; one GPU thread or CPU task each.
-        """
-        if count <= 0:
-            return
+    def run[F: Kernel, //](self, kernel: F, shape: Coord) raises:
+        """Call `kernel(coord)` once per coordinate: GPU threads or CPU tasks."""
         comptime if GPU_AVAILABLE:
             if self.gpu:
-                self.ctx.enqueue_function[gpu_kernel[body]](
-                    self.data,
-                    self.terrain,
-                    p,
-                    Int32(count),
-                    grid_dim=(count + 127) // 128,
-                    block_dim=128,
-                )
+                elementwise[1, target="gpu"](kernel, shape, self.ctx)
                 return
-        var data, terrain = self.pointers()
+        elementwise[1, target="cpu"](kernel, shape, self.ctx)
 
-        def cpu_body(i: Int) {data, terrain, p}:
-            body(i, data, terrain, p)
-
-        parallelize(cpu_body, count, workers(count), self.ctx)
-
-    def blocks[
-        kernel: def(Ptr, Ptr, Params) thin -> None, threads: Int
-    ](mut self, count: Int, p: Params) raises:
-        """GPU only: launch `kernel` with `count` blocks of `threads` threads.
-        """
-        comptime if GPU_AVAILABLE:
-            self.ctx.enqueue_function[kernel](
-                self.data,
-                self.terrain,
-                p,
-                grid_dim=count,
-                block_dim=threads,
-            )
-
-    def tiles[
-        kernel: def(Ptr, Ptr, Params, Int32, Int32, Int32) thin -> None
-    ](mut self, m: Int, n: Int, k: Int, z: Int, p: Params) raises:
-        """GPU only: launch a 64x64-tile matmul kernel over an m x n result
-        with reduction length k, replicated z times along grid z."""
-        comptime if GPU_AVAILABLE:
-            self.ctx.enqueue_function[kernel](
-                self.data,
-                self.terrain,
-                p,
-                Int32(m),
-                Int32(n),
-                Int32(k),
-                grid_dim=((n + 63) // 64, (m + 63) // 64, z),
-                block_dim=256,
-            )
-
-    def either[
-        gpu_body: Body, cpu_body: Body
-    ](mut self, gpu_count: Int, cpu_count: Int, p: Params) raises:
-        """Run a kernel whose work decomposition differs per device."""
+    def gemm[
+        transpose_b: Bool = False, epilogue: Epilogue = None
+    ](
+        self,
+        c: TileTensor[mut=True, address_space=.GENERIC, ...],
+        a: TileTensor[address_space=.GENERIC, ...],
+        b: TileTensor[address_space=.GENERIC, ...],
+    ) raises:
+        """c = a @ b (or a @ b^T) with an optional element-wise epilogue."""
         comptime if GPU_AVAILABLE:
             if self.gpu:
-                self.run[gpu_body](gpu_count, p)
+                matmul[
+                    transpose_b=transpose_b,
+                    elementwise_compute_lambda_fn=epilogue,
+                    target="gpu",
+                ](c, a, b, Optional(self.ctx))
                 return
-        self.run[cpu_body](cpu_count, p)
+        matmul[
+            transpose_b=transpose_b,
+            elementwise_compute_lambda_fn=epilogue,
+            target="cpu",
+        ](c, a, b, Optional(self.ctx))
 
-    def read(self, offset: Int, count: Int) raises -> List[Float32]:
-        """Copy `count` floats of the arena to the host (synchronizes)."""
-        var result = List[Float32](length=count, fill=0)
-        var view = self.data.create_sub_buffer[DType.float32](offset, count)
-        self.ctx.enqueue_copy(result.unsafe_ptr(), view)
+    def read(self, buffer: Buffer) raises -> List[Float32]:
+        var result = List[Float32](length=len(buffer), fill=0)
+        self.ctx.enqueue_copy(result.unsafe_ptr(), buffer)
         self.ctx.synchronize()
         return result^
 
-    def write(mut self, offset: Int, values: List[Float32]) raises:
-        var view = self.data.create_sub_buffer[DType.float32](
-            offset, len(values)
-        )
-        self.ctx.enqueue_copy(view, values.unsafe_ptr())
+    def write(self, buffer: Buffer, values: List[Float32]) raises:
+        self.ctx.enqueue_copy(buffer, values.unsafe_ptr())
         self.ctx.synchronize()
 
-
-def workers(count: Int) -> Int:
-    return max(1, min(num_physical_cores(), count // 64))
-
-
-@inline(.always)
-def clamp(x: Float32, lo: Float32, hi: Float32) -> Float32:
-    return min(max(x, lo), hi)
-
-
-@inline(.always)
-def uniform(seed: UInt32) -> Float32:
-    var x = seed
-    x ^= x >> 16
-    x *= 0x7FEB352D
-    x ^= x >> 15
-    x *= 0x846CA68B
-    x ^= x >> 16
-    # 23 bits keep the half-unit offset representable: strictly 0 < u < 1.
-    # A 24-bit midpoint can round to 1 and index past the spawn table.
-    return (Float32(x >> 9) + 0.5) / 8388608.0
-
-
-@inline(.always)
-def normal(seed: UInt32) -> Float32:
-    return sqrt(-2.0 * log(uniform(seed))) * cos(
-        6.283185307 * uniform(seed + 0x9E3779B9)
-    )
+    def upload(self, values: List[Float32]) raises -> Buffer:
+        var buffer = self.ctx.enqueue_create_buffer[DType.float32](len(values))
+        self.write(buffer, values)
+        return buffer^
 
 
 def read_floats(path: String) raises -> List[Float32]:
-    var file = open(path, "r")
-    var raw = file.read_bytes()
-    if len(raw) % 4 != 0:
-        raise Error("truncated float32 file: " + path)
-    var result = List[Float32](capacity=len(raw) // 4)
-    var ptr = raw.unsafe_ptr().unsafe_bitcast[Float32]()
-    for i in range(len(raw) // 4):
-        result.append(ptr[unsafe_offset=i])
+    var raw = open(path, "r").read_bytes()
+    var result = List[Float32](length=len(raw) // 4, fill=0)
+    for i in range(len(result)):
+        result[i] = raw.unsafe_ptr().unsafe_bitcast[Float32]()[unsafe_offset=i]
     return result^
 
 

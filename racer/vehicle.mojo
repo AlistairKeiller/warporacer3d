@@ -4,16 +4,23 @@ No contacts or wheel bodies. Surface tilt sets the local frame and gravity.
 An implicit two-variable tire update remains stable at zero/reverse speed.
 """
 from std.math import cos, sin, sqrt
-from .device import clamp
 
+comptime SUBSTEPS = 4  # per 60 Hz environment step
 comptime DT = Float32(1.0 / 240.0)
 comptime MASS = Float32(3.0)
 comptime AXLE = Float32(0.1651)
 comptime INERTIA = Float32(0.11)
 
 
+@inline(.always)
+def clamp(x: Float32, lo: Float32, hi: Float32) -> Float32:
+    return min(max(x, lo), hi)
+
+
 @fieldwise_init
 struct Frame(TrivialRegisterPassable):
+    """Forward and left unit vectors on the road surface, plus the normal's z."""
+
     var fx: Float32
     var fy: Float32
     var fz: Float32
@@ -73,7 +80,6 @@ def integrate(
     if drive * car.u > 0:
         drive *= max(Float32(0), 1 - abs(car.u) / 5)
     drive = clamp(drive, -load, load)
-    var front_limit = load
     var rear_limit = sqrt(max(Float32(0), load * load - drive * drive))
     # Solve the linear lateral/yaw equations implicitly (a symmetric bicycle).
     var h = DT * coefficient
@@ -87,9 +93,7 @@ def integrate(
     var v = (b1 * a22 - b2 * a12) / determinant
     var yaw = (b2 * a11 - b1 * a21) / determinant
     var front = clamp(
-        coefficient * (car.u * s - (v + AXLE * yaw) * c),
-        -front_limit,
-        front_limit,
+        coefficient * (car.u * s - (v + AXLE * yaw) * c), -load, load
     )
     var rear = clamp(-coefficient * (v - AXLE * yaw), -rear_limit, rear_limit)
     var u = car.u + DT * (
@@ -101,9 +105,7 @@ def integrate(
     car.x += DT * (f.fx * car.u + f.lx * car.v)
     car.y += DT * (f.fy * car.u + f.ly * car.v)
     car.heading += DT * car.yaw * f.nz / max(Float32(0.1), 1 - f.fz * f.fz)
-    car.heading = (
-        car.heading - 6.283185307 if car.heading > 3.141592654 else car.heading
-    )
-    car.heading = (
-        car.heading + 6.283185307 if car.heading < -3.141592654 else car.heading
-    )
+    if car.heading > 3.141592654:
+        car.heading -= 6.283185307
+    if car.heading < -3.141592654:
+        car.heading += 6.283185307

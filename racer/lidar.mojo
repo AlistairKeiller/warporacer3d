@@ -1,12 +1,18 @@
-"""Parallel distance lidar: a BVH ray cast per beam over the map triangles."""
-from std.math import cos, sin
+"""A planar scanning lidar like the Hokuyo UST-10LX: 270 degrees, 10 m range.
+
+Beams lie in the car's body plane. Each ray walks the map's coarse cells
+(2-D DDA) and tests the triangles listed in every cell it crosses.
+"""
+from std.math import cos, sin, floor
 from std.sys import get_defined_int
-from .device import Ptr
-from .layout import BEAMS, ROWS, RAYS
+from .device import Mat
+from .map import Map
 from .vehicle import Frame
 
-comptime RANGE = Float32(get_defined_int["RANGE", 10]())
-comptime ELEVATION = Float32(0.261799388)
+# Every tenth beam of the UST-10LX's 1081; `-D BEAMS=1081` for all of them.
+comptime BEAMS = get_defined_int["BEAMS", 108]()
+comptime RANGE = Float32(10)
+comptime FOV = Float32(4.71238898)  # 270 degrees
 comptime MOUNT_FORWARD = Float32(0.2)
 comptime MOUNT_HEIGHT = Float32(0.23)
 comptime Vec = SIMD[DType.float32, 4]
@@ -40,19 +46,18 @@ def mount(x: Float32, y: Float32, z: Float32, f: Frame) -> Vec:
 
 
 def direction(beam: Int, f: Frame) -> Vec:
-    var azimuth = -2.35619449 + Float32(beam % BEAMS) * (
-        4.71238898 / Float32(BEAMS - 1)
+    var azimuth = -FOV / 2 + Float32(beam) * (FOV / Float32(BEAMS - 1))
+    return cos(azimuth) * xyz(f.fx, f.fy, f.fz) + sin(azimuth) * xyz(
+        f.lx, f.ly, f.lz
     )
-    var elevation = Float32(beam // BEAMS - 1) * ELEVATION
-    var forward = xyz(f.fx, f.fy, f.fz)
-    var left = xyz(f.lx, f.ly, f.lz)
-    return cos(elevation) * (
-        cos(azimuth) * forward + sin(azimuth) * left
-    ) + sin(elevation) * cross(forward, left)
 
 
 @inline(.always)
-def triangle(origin: Vec, direction: Vec, a: Vec, e1: Vec, e2: Vec) -> Float32:
+def triangle(d: Mat[1], t: Int, origin: Vec, direction: Vec) -> Float32:
+    """Moller-Trumbore distance to the triangle at `t`, or RANGE when missed."""
+    var a = xyz(d[0, t], d[0, t + 1], d[0, t + 2])
+    var e1 = xyz(d[0, t + 3], d[0, t + 4], d[0, t + 5])
+    var e2 = xyz(d[0, t + 6], d[0, t + 7], d[0, t + 8])
     var p = cross(direction, e2)
     var determinant = dot(e1, p)
     if abs(determinant) < 1e-8:
@@ -68,60 +73,34 @@ def triangle(origin: Vec, direction: Vec, a: Vec, e1: Vec, e2: Vec) -> Float32:
     return hit if v >= 0 and u + v <= 1 and hit >= 0 else RANGE
 
 
-def ray(map: Ptr, origin: Vec, direction: Vec) -> Float32:
-    var nodes = Int(map[unsafe_offset=11])
-    var tree = (
-        16
-        + 4 * Int(map[unsafe_offset=2]) * Int(map[unsafe_offset=3])
-        + 10 * Int(map[unsafe_offset=4])
-        + Int(map[unsafe_offset=10])
-    )
-    var triangles = tree + nodes * 9
-    var inverse = Vec(0)
-    comptime for axis in range(3):
-        inverse[axis] = (
-            0 if abs(direction[axis]) < 1e-8 else 1 / direction[axis]
-        )
-    var distance = RANGE
-    var node = 0
-    while node < nodes:
-        var k = tree + node * 9
-        var near: Float32 = 0
-        var far = distance
-        comptime for axis in range(3):
-            var lo = map[unsafe_offset=k + axis] - origin[axis]
-            var hi = map[unsafe_offset=k + 3 + axis] - origin[axis]
-            if inverse[axis] == 0:
-                if lo > 0 or hi < 0:
-                    far = -1
-            else:
-                var a = lo * inverse[axis]
-                var b = hi * inverse[axis]
-                near = max(near, min(a, b))
-                far = min(far, max(a, b))
-        if near <= far:
-            var count = Int(map[unsafe_offset=k + 8])
-            if count == 0:
-                node += 1
-                continue
-            var first = Int(map[unsafe_offset=k + 7])
-            for face in range(first, first + count):
-                var t = triangles + face * 9
-                var a = xyz(
-                    map[unsafe_offset=t],
-                    map[unsafe_offset=t + 1],
-                    map[unsafe_offset=t + 2],
-                )
-                var e1 = xyz(
-                    map[unsafe_offset=t + 3],
-                    map[unsafe_offset=t + 4],
-                    map[unsafe_offset=t + 5],
-                )
-                var e2 = xyz(
-                    map[unsafe_offset=t + 6],
-                    map[unsafe_offset=t + 7],
-                    map[unsafe_offset=t + 8],
-                )
-                distance = min(distance, triangle(origin, direction, a, e1, e2))
-        node = Int(map[unsafe_offset=k + 6])
-    return distance
+def ray(map: Map, d: Mat[1], origin: Vec, direction: Vec) -> Float32:
+    var best = RANGE
+    var u = (origin[0] - map.x0 + map.cell / 2) / map.coarse
+    var v = (origin[1] - map.y0 + map.cell / 2) / map.coarse
+    var ix = Int(floor(u))
+    var iy = Int(floor(v))
+    var step_x = 1 if direction[0] > 0 else -1
+    var step_y = 1 if direction[1] > 0 else -1
+    var delta_x = abs(map.coarse / direction[0]) if direction[0] != 0 else 1e30
+    var delta_y = abs(map.coarse / direction[1]) if direction[1] != 0 else 1e30
+    var next_x = (
+        (Float32(ix + (step_x + 1) // 2) - u) * map.coarse / direction[0]
+    ) if direction[0] != 0 else 1e30
+    var next_y = (
+        (Float32(iy + (step_y + 1) // 2) - v) * map.coarse / direction[1]
+    ) if direction[1] != 0 else 1e30
+    var t: Float32 = 0
+    while t < best and ix >= 0 and iy >= 0 and ix < map.cnx and iy < map.cny:
+        var k = map.starts + iy * map.cnx + ix
+        for e in range(Int(d[0, k]), Int(d[0, k + 1])):
+            var face = Int(d[0, map.items + e])
+            best = min(best, triangle(d, map.triangles + face * 9, origin, direction))
+        if next_x < next_y:
+            t = next_x
+            next_x += delta_x
+            ix += step_x
+        else:
+            t = next_y
+            next_y += delta_y
+            iy += step_y
+    return best

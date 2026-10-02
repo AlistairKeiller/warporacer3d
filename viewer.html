@@ -170,9 +170,9 @@
     <div id="status">Starting simulation…</div>
     <div id="error"></div>
     <p class="muted">W/S or ↑/↓: throttle<br />A/D or ←/→: steer<br />Space: pause · R: reset</p>
-    <small>Drag to orbit · Scroll to zoom<br />Road edges and walls end an episode.</small>
+    <small>Drag to orbit · Scroll to zoom<br />Walls end an episode.</small>
   </aside>
-  <footer>60 Hz dynamics · terrain-following bicycle · live CPU / GPU simulation</footer>
+  <footer>60 Hz dynamics · terrain-following bicycle · 2-D lidar · live CPU / GPU simulation</footer>
   <script type="module">
     const $ = (id) => document.getElementById(id);
     const canvas = $("view"),
@@ -272,11 +272,12 @@
       );
     }
     function buildScene(d, info) {
-      // Decode the raw .wrmap: header, distance/height/slope grids, route
-      // segments, spawn table, BVH nodes, and triangles (a, b - a, c - a).
-      const nx = d[2], ny = d[3], count = d[4], cells = nx * ny;
-      const segments = 16 + 4 * cells, spawns = segments + 10 * count;
-      const tree = spawns + d[10], triangles = tree + 9 * d[11], total = d[12];
+      // Decode the raw .wrmap: header, clearance and height grids, route
+      // segments, spawn table, coarse-cell triangle lists, triangles (a, b - a, c - a).
+      const nx = d[2], ny = d[3], count = d[8], cells = nx * ny;
+      const segments = 16 + 2 * cells, spawns = segments + 9 * count;
+      const starts = spawns + d[10], items = starts + d[11] * d[12] + 1;
+      const triangles = items + d[15], total = d[14];
       const vertices = new Float32Array(total * 9), colours = new Float32Array(total * 9);
       const light = [0.3, -0.4, 0.86], lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
       for (let t = 0; t < total; t++) {
@@ -292,21 +293,16 @@
         });
       }
       const route = [];
-      for (let i = 0; i < count; i++) route.push(d[segments + i * 10], d[segments + i * 10 + 1], d[segments + i * 10 + 2]);
+      for (let i = 0; i < count; i++) route.push(d[segments + i * 9], d[segments + i * 9 + 1], d[segments + i * 9 + 2]);
       return {
         ...info,
         vertices,
         colours,
         route,
-        closed: d[5] > 0,
+        closed: d[7] > 0,
         centre: [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2],
         extent: Math.max(hi[0] - lo[0], hi[1] - lo[1]),
-        grid: {
-          nx, ny, x: d[6], y: d[7], cell: d[8],
-          height: d.subarray(16 + cells, 16 + 2 * cells),
-          sx: d.subarray(16 + 2 * cells, 16 + 3 * cells),
-          sy: d.subarray(16 + 3 * cells, 16 + 4 * cells),
-        },
+        grid: { nx, ny, x: d[4], y: d[5], cell: d[6], height: d.subarray(16 + cells, 16 + 2 * cells) },
       };
     }
     const scene = buildScene(
@@ -319,17 +315,20 @@
     for (let i = 0; i < scene.cars; i++) $("car").add(new Option(String(i + 1), String(i)));
     const road = mesh(scene.vertices, scene.colours, gl.TRIANGLES);
     function surface(x, y) {
-      const g = scene.grid,
-        ix = Math.round((x - g.x) / g.cell),
-        iy = Math.round((y - g.y) / g.cell);
-      if (ix < 0 || iy < 0 || ix >= g.nx || iy >= g.ny) return { z: 0, sx: 0, sy: 0 };
-      const i = iy * g.nx + ix;
+      // Bilinear height between cell centres, the same patch the physics uses.
+      const g = scene.grid, fx = (x - g.x) / g.cell, fy = (y - g.y) / g.cell;
+      const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy;
+      if (ix < 0 || iy < 0 || ix + 1 >= g.nx || iy + 1 >= g.ny) return { z: 0, sx: 0, sy: 0 };
+      const k = iy * g.nx + ix, h00 = g.height[k], h10 = g.height[k + 1], h01 = g.height[k + g.nx], h11 = g.height[k + g.nx + 1];
       return {
-        z: g.height[i] + g.sx[i] * (x - g.x - ix * g.cell) + g.sy[i] * (y - g.y - iy * g.cell),
-        sx: g.sx[i],
-        sy: g.sy[i],
+        z: h00 * (1 - tx) * (1 - ty) + h10 * tx * (1 - ty) + h01 * (1 - tx) * ty + h11 * tx * ty,
+        sx: ((h10 - h00) * (1 - ty) + (h11 - h01) * ty) / g.cell,
+        sy: ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) / g.cell,
       };
     }
+    // Snapshots are feature-major: row k of state, then observations, actions, reward, done.
+    const row = (k) => k * scene.cars;
+    const obsRow = (r) => (scene.state + r) * scene.cars;
     const routeVertices = [];
     for (let i = 3; i < scene.route.length + (scene.closed ? 3 : 0); i += 3) {
       const a = scene.route.slice(i - 3, i),
@@ -389,7 +388,7 @@
       zoom = Math.max(0.3, Math.min(5, zoom * Math.exp(e.deltaY * 0.001)));
     };
     function frame(i) {
-      const s = state.slice(i * scene.state, (i + 1) * scene.state),
+      const s = Array.from({ length: scene.state }, (_, k) => state[row(k) + i]),
         ground = surface(s[0], s[1]),
         up = unit([-ground.sx, -ground.sy, 1]),
         f = unit([
@@ -515,28 +514,22 @@
         if ($("lidar").checked) {
           const beams = [],
             origin = add(p, add(scale(f, scene.mount[0]), scale(up, scene.mount[2])));
-          for (let row = 0; row < scene.rows; row++) {
-            const elevation = (row - 1) * scene.elevation;
-            for (let b = 0; b < scene.beams; b++) {
-              const azimuth = -Math.PI * 0.75 + (b * Math.PI * 1.5) / (scene.beams - 1),
-                distance = state[scene.cars * scene.state + i * scene.obs + 8 + row * scene.beams + b] * scene.range,
-                direction = add(
-                  scale(add(scale(f, Math.cos(azimuth)), scale(left, Math.sin(azimuth))), Math.cos(elevation)),
-                  scale(up, Math.sin(elevation)),
-                );
-              beams.push(...origin, ...add(origin, scale(direction, distance)));
-            }
+          for (let b = 0; b < scene.beams; b++) {
+            const azimuth = -Math.PI * 0.75 + (b * Math.PI * 1.5) / (scene.beams - 1),
+              distance = state[obsRow(8 + b) + i] * scene.range,
+              direction = add(scale(f, Math.cos(azimuth)), scale(left, Math.sin(azimuth)));
+            beams.push(...origin, ...add(origin, scale(direction, distance)));
           }
           draw(lines(beams, [0.3, 0.48, 0.55], lidarMesh));
         }
         $("speed").textContent = Math.hypot(s[3], s[4]).toFixed(2) + " m/s";
         $("grade").textContent =
           ((Math.asin(f[2]) * 180) / Math.PI).toFixed(1) + "° / " + p[2].toFixed(2) + " m";
-        const a = scene.cars * (scene.state + scene.obs) + i * 2;
+        const throttleAt = scene.cars * (scene.state + scene.obs + 1) + i;
         $("control").textContent =
           ((s[6] * 180) / Math.PI).toFixed(1) +
           "° / " +
-          Math.max(-1, Math.min(1, state[a + 1])).toFixed(2);
+          Math.max(-1, Math.min(1, state[throttleAt])).toFixed(2);
         $("reward").textContent = s[12].toFixed(2);
         $("progress").textContent = s[7].toFixed(1) + " m";
         $("events").textContent = totalResets + " / " + totalFinishes;
@@ -553,7 +546,7 @@
           (keys.has("a") || keys.has("arrowleft") ? 1 : 0) -
           (keys.has("d") || keys.has("arrowright") ? 1 : 0);
         // Actions are steering rates; return to centre when the keys are released.
-        const selectedSteer = state ? state[Number($("car").value) * scene.state + 6] : 0;
+        const selectedSteer = state ? state[row(6) + Number($("car").value)] : 0;
         steer = direction
           ? direction * 100
           : Math.max(-100, Math.min(100, ((-selectedSteer * 60) / 3.2) * 100));
@@ -578,8 +571,7 @@
           }
           trails[i].push(add(p, [0, 0, 0.025]));
           if (trails[i].length > 240) trails[i].shift();
-          const r = scene.cars * (scene.state + scene.obs + 2) + i * 2 + 1;
-          if (state[r] === 3) totalFinishes++;
+          if (state[scene.cars * (scene.state + scene.obs + 3) + i] === 3) totalFinishes++;
         }
         $("status").textContent = paused
           ? "Paused"
