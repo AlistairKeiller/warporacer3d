@@ -6,7 +6,7 @@ Beams lie in the car's body plane. Each ray walks the map's coarse cells
 from std.math import cos, sin, floor
 from std.sys import get_defined_int
 from .device import Mat
-from .map import Map
+from .map import Map, cross, dot
 from .vehicle import Frame
 
 # Every tenth beam of the UST-10LX's 1081; `-D BEAMS=1081` for all of them.
@@ -18,46 +18,25 @@ comptime MOUNT_HEIGHT = Float32(0.23)
 comptime Vec = SIMD[DType.float32, 4]
 
 
-@inline(.always)
-def xyz(x: Float32, y: Float32, z: Float32) -> Vec:
-    var result = Vec(0)
-    result[0], result[1], result[2] = x, y, z
-    return result
-
-
-@inline(.always)
-def dot(a: Vec, b: Vec) -> Float32:
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-
-@inline(.always)
-def cross(a: Vec, b: Vec) -> Vec:
-    return xyz(
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    )
-
-
 def mount(x: Float32, y: Float32, z: Float32, f: Frame) -> Vec:
-    var forward = xyz(f.fx, f.fy, f.fz)
-    var up = cross(forward, xyz(f.lx, f.ly, f.lz))
-    return xyz(x, y, z) + MOUNT_FORWARD * forward + MOUNT_HEIGHT * up
+    var forward = Vec(f.fx, f.fy, f.fz, 0)
+    var up = cross(forward, Vec(f.lx, f.ly, f.lz, 0))
+    return Vec(x, y, z, 0) + MOUNT_FORWARD * forward + MOUNT_HEIGHT * up
 
 
 def direction(beam: Int, f: Frame) -> Vec:
     var azimuth = -FOV / 2 + Float32(beam) * (FOV / Float32(BEAMS - 1))
-    return cos(azimuth) * xyz(f.fx, f.fy, f.fz) + sin(azimuth) * xyz(
-        f.lx, f.ly, f.lz
+    return cos(azimuth) * Vec(f.fx, f.fy, f.fz, 0) + sin(azimuth) * Vec(
+        f.lx, f.ly, f.lz, 0
     )
 
 
 @inline(.always)
 def triangle(d: Mat[1], t: Int, origin: Vec, direction: Vec) -> Float32:
     """Moller-Trumbore distance to the triangle at `t`, or RANGE when missed."""
-    var a = xyz(d[0, t], d[0, t + 1], d[0, t + 2])
-    var e1 = xyz(d[0, t + 3], d[0, t + 4], d[0, t + 5])
-    var e2 = xyz(d[0, t + 6], d[0, t + 7], d[0, t + 8])
+    var a = Vec(d[0, t], d[0, t + 1], d[0, t + 2], 0)
+    var e1 = Vec(d[0, t + 3], d[0, t + 4], d[0, t + 5], 0)
+    var e2 = Vec(d[0, t + 6], d[0, t + 7], d[0, t + 8], 0)
     var p = cross(direction, e2)
     var determinant = dot(e1, p)
     if abs(determinant) < 1e-8:

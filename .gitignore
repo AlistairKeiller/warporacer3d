@@ -3,7 +3,4 @@ build/
 *.wrmap
 *.wrppo
 .DS_Store
-# pixi environments
-.pixi/*
-!.pixi/config.toml
 __pycache__/

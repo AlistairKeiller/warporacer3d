@@ -1,8 +1,8 @@
 """One device abstraction for the CPU and every GPU MAX supports.
 
 Buffers are flat float32 device memory; `mat` views them as row-major
-matrices with a static row count. Kernels are closures run per element by
-MAX's `elementwise`; matrix products go through MAX's `matmul`.
+matrices with a static row count. Kernels are plain closures called once per
+index by MAX's `elementwise`; matrix products go through MAX's `matmul`.
 """
 from std.sys import has_accelerator, get_defined_bool
 from layout import TileTensor, Coord, Idx, row_major, ComptimeInt
@@ -19,9 +19,8 @@ comptime Buffer = DeviceBuffer[DType.float32]
 comptime Mat[rows: Int] = TileTensor[
     DType.float32, RowMajorLayout[ComptimeInt[rows], Int], MutAnyOrigin
 ]
-comptime Kernel = ImplicitlyCopyable & RegisterPassable & def[
-    width: Int, alignment: Int = 1
-](Coord) -> None
+comptime Kernel = ImplicitlyCopyable & RegisterPassable & def(Int) -> None
+comptime Kernel2 = ImplicitlyCopyable & RegisterPassable & def(Int, Int) -> None
 comptime Epilogue = Optional[elementwise_compute_lambda_type]
 
 
@@ -56,8 +55,27 @@ struct Device(Movable):
         self.ctx.synchronize()
         return buffer^
 
-    def run[F: Kernel, //](self, kernel: F, shape: Coord) raises:
-        """Call `kernel(coord)` once per coordinate: GPU threads or CPU tasks."""
+    def run[F: Kernel, //](self, kernel: F, n: Int) raises:
+        """Call `kernel(i)` for every i < n: GPU threads or CPU tasks."""
+
+        def wrapped[width: Int, alignment: Int = 1](c: Coord) {var}:
+            kernel(Int(c[0].value()))
+
+        self.launch(wrapped, Coord(n))
+
+    def run[F: Kernel2, //](self, kernel: F, rows: Int, cols: Int) raises:
+        """Call `kernel(i, j)` over a rows x cols index space."""
+
+        def wrapped[width: Int, alignment: Int = 1](c: Coord) {var}:
+            kernel(Int(c[0].value()), Int(c[1].value()))
+
+        self.launch(wrapped, Coord(rows, cols))
+
+    def launch[
+        F: ImplicitlyCopyable & RegisterPassable & def[
+            width: Int, alignment: Int = 1
+        ](Coord) -> None, //,
+    ](self, kernel: F, shape: Coord) raises:
         comptime if GPU_AVAILABLE:
             if self.gpu:
                 elementwise[1, target="gpu"](kernel, shape, self.ctx)
@@ -93,11 +111,11 @@ struct Device(Movable):
         self.ctx.synchronize()
         return result^
 
-    def write(self, buffer: Buffer, values: List[Float32]) raises:
+    def write(self, buffer: Buffer, values: Span[Float32, _]) raises:
         self.ctx.enqueue_copy(buffer, values.unsafe_ptr())
         self.ctx.synchronize()
 
-    def upload(self, values: List[Float32]) raises -> Buffer:
+    def upload(self, values: Span[Float32, _]) raises -> Buffer:
         var buffer = self.ctx.enqueue_create_buffer[DType.float32](len(values))
         self.write(buffer, values)
         return buffer^
@@ -105,13 +123,15 @@ struct Device(Movable):
 
 def read_floats(path: String) raises -> List[Float32]:
     var raw = open(path, "r").read_bytes()
-    var result = List[Float32](length=len(raw) // 4, fill=0)
-    for i in range(len(result)):
-        result[i] = raw.unsafe_ptr().unsafe_bitcast[Float32]()[unsafe_offset=i]
-    return result^
+    return List(
+        Span(
+            unsafe_ptr=raw.unsafe_ptr().unsafe_bitcast[Float32](),
+            length=len(raw) // 4,
+        )
+    )
 
 
-def write_floats(path: String, values: List[Float32]) raises:
+def write_floats(path: String, values: Span[Float32, _]) raises:
     var file = open(path, "w")
     file.write_all(
         Span(

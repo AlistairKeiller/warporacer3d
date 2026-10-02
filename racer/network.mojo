@@ -7,7 +7,7 @@ weight-gradient product is a plain MAX matmul (`transpose_b` for gradients).
 from std.math import tanh, sqrt
 from std.random.philox import NormalRandom
 from std.utils import IndexList
-from layout import Coord, Idx
+from layout import Coord
 from .device import Device, Buffer, Mat, mat
 from .simulation import IN, OBS, OUT
 
@@ -37,11 +37,11 @@ struct Activations:
         var h1 = mat[HA](self.h1, cols)
         var h2 = mat[HA](self.h2, cols)
 
-        def ones[width: Int, alignment: Int = 1](c: Coord) {var}:
-            h1[H, Int(c[0].value())] = 1
-            h2[H, Int(c[0].value())] = 1
+        def ones(i: Int) {var}:
+            h1[H, i] = 1
+            h2[H, i] = 1
 
-        device.run(ones, Coord(cols))
+        device.run(ones, cols)
 
 
 @__parameter
@@ -49,6 +49,22 @@ def activate[
     dtype: DType, width: SIMDLength, *, alignment: Int = 1
 ](idx: IndexList[2], v: SIMD[dtype, width]) -> SIMD[dtype, width]:
     return tanh(v.cast[DType.float32]()).cast[dtype]()
+
+
+def through[
+    rows: Int
+](device: Device, result: Mat[HA], wt: Mat[HA], delta: Mat[rows], h: Mat[HA]) raises:
+    """result = tanh'(h) * (wt @ delta): the gradient back through one layer."""
+
+    @__parameter
+    @__copy_capture(h)
+    def mask[
+        dtype: DType, width: SIMDLength, *, alignment: Int = 1
+    ](idx: IndexList[2], v: SIMD[dtype, width]) -> SIMD[dtype, width]:
+        var a = h.load[width=width](Coord(idx[0], idx[1]))
+        return (v.cast[DType.float32]() * (1 - a * a)).cast[dtype]()
+
+    device.gemm[epilogue=mask](result, wt, delta)
 
 
 struct Policy:
@@ -62,9 +78,8 @@ struct Policy:
         self.w2t = device.alloc(HA * OUT)
         var theta = mat[1](self.theta, P)
 
-        def init[width: Int, alignment: Int = 1](c: Coord) {var}:
+        def init(i: Int) {var}:
             """Gaussian fan-in init; bias columns start at zero."""
-            var i = Int(c[0].value())
             var z = NormalRandom(seed=UInt64(seed), subsequence=UInt64(i))
             var value: Float32 = 0
             if i < W1:
@@ -81,7 +96,7 @@ struct Policy:
                 value = -0.5
             theta[0, i] = value
 
-        device.run(init, Coord(P))
+        device.run(init, P)
         self.transpose(device)
 
     def transpose(mut self, device: Device) raises:
@@ -90,15 +105,13 @@ struct Policy:
         var w1t = mat[HA](self.w1t, H)
         var w2t = mat[HA](self.w2t, OUT)
 
-        def kernel[width: Int, alignment: Int = 1](c: Coord) {var}:
-            var k = Int(c[0].value())
-            var j = Int(c[1].value())
+        def kernel(k: Int, j: Int) {var}:
             if j < H:
                 w1t[k, j] = w1[j, k]
             if j < OUT:
                 w2t[k, j] = w2[j, k]
 
-        device.run(kernel, Coord(Idx[HA], Idx[H]))
+        device.run(kernel, HA, H)
 
     def log_std(mut self) -> Mat[1]:
         return mat[1](self.theta, 2, LOGSTD)
@@ -127,28 +140,9 @@ struct Policy:
         """Backpropagate output gradients d3 into `grad` (W0, W1, W2 entries)."""
         var h1 = mat[HA](a.h1, a.cols)
         var h2 = mat[HA](a.h2, a.cols)
-
-        @__parameter
-        @__copy_capture(h2)
-        def mask2[
-            dtype: DType, width: SIMDLength, *, alignment: Int = 1
-        ](idx: IndexList[2], v: SIMD[dtype, width]) -> SIMD[dtype, width]:
-            var h = h2.load[width=width](Coord(idx[0], idx[1]))
-            return (v.cast[DType.float32]() * (1 - h * h)).cast[dtype]()
-
-        @__parameter
-        @__copy_capture(h1)
-        def mask1[
-            dtype: DType, width: SIMDLength, *, alignment: Int = 1
-        ](idx: IndexList[2], v: SIMD[dtype, width]) -> SIMD[dtype, width]:
-            var h = h1.load[width=width](Coord(idx[0], idx[1]))
-            return (v.cast[DType.float32]() * (1 - h * h)).cast[dtype]()
-
-        device.gemm[epilogue=mask2](
-            mat[HA](d2, a.cols), mat[HA](self.w2t, OUT), d3
-        )
-        device.gemm[epilogue=mask1](
-            mat[HA](d1, a.cols), mat[HA](self.w1t, H), mat[H](d2, a.cols)
+        through(device, mat[HA](d2, a.cols), mat[HA](self.w2t, OUT), d3, h2)
+        through(
+            device, mat[HA](d1, a.cols), mat[HA](self.w1t, H), mat[H](d2, a.cols), h1
         )
         device.gemm[transpose_b=True](
             mat[H](grad, IN, W0), mat[H](d1, a.cols), x

@@ -3,14 +3,12 @@
 Scalar statistics (advantage moments, gradient norm, KL) are reduced on the
 host; everything per sample or per weight runs as a kernel.
 """
-from std.math import exp, log, sqrt, isfinite
+from std.math import exp, sqrt
 from std.random.philox import Random
-from std.utils import IndexList
-from max.algorithm.reduction import mean, variance, sum
-from layout import Coord, Idx
-from .device import Device, Buffer, Mat, mat, read_floats, write_floats
-from .simulation import Sim, STATE, IN, OUT
-from .network import Policy, Activations, P, LOGSTD, H, HA
+from max.algorithm.reduction import mean, variance
+from .device import Device, Buffer, mat, read_floats, write_floats
+from .simulation import Sim, IN, OUT
+from .network import Policy, Activations, P, LOGSTD, HA
 
 comptime ROLLOUT = 32
 comptime EPOCHS = 4
@@ -112,10 +110,10 @@ struct Trainer:
         var o = mat[OUT](self.acts.o, n)
         var value = mat[1](self.value, n, ROLLOUT * n)
 
-        def bootstrap[width: Int, alignment: Int = 1](c: Coord) {var}:
-            value[0, Int(c[0].value())] = o[2, Int(c[0].value())]
+        def bootstrap(i: Int) {var}:
+            value[0, i] = o[2, i]
 
-        device.run(bootstrap, Coord(n))
+        device.run(bootstrap, n)
         self.gae(device)
         return mean(Span(device.read(self.reward)))
 
@@ -128,8 +126,7 @@ struct Trainer:
         var advantage = mat[1](self.advantage, ROLLOUT * n)
         var target = mat[1](self.target, ROLLOUT * n)
 
-        def kernel[width: Int, alignment: Int = 1](c: Coord) {var}:
-            var i = Int(c[0].value())
+        def kernel(i: Int) {var}:
             var next = values[0, ROLLOUT * n + i]
             var running: Float32 = 0
             for t in range(ROLLOUT - 1, -1, -1):
@@ -141,7 +138,7 @@ struct Trainer:
                 target[0, k] = values[0, k] + running
                 next = values[0, k]
 
-        device.run(kernel, Coord(n))
+        device.run(kernel, n)
 
     def update(
         mut self, device: Device, mut policy: Policy, iteration: Int
@@ -153,13 +150,14 @@ struct Trainer:
         var kl: Float32 = 0
         for epoch in range(EPOCHS):
             for m in range(MINIBATCHES):
-                var dls, divergence = self.minibatch(
+                kl = self.minibatch(
                     device, policy, m * self.batch, 1000003 * iteration + 7 * epoch, adv_mean, adv_scale
                 )
-                kl = divergence
-                var norm = sqrt(squares(device.read(self.grad)) + (dls * dls).reduce_add())
+                var norm: Float32 = 0
+                for g in device.read(self.grad):
+                    norm += g * g
                 self.step += 1
-                self.adam(device, policy, dls, min(Float32(1), MAX_NORM / (norm + 1e-8)))
+                self.adam(device, policy, min(Float32(1), MAX_NORM / (sqrt(norm) + 1e-8)))
         return kl
 
     def minibatch(
@@ -170,9 +168,9 @@ struct Trainer:
         shuffle: Int,
         adv_mean: Float32,
         adv_scale: Float32,
-    ) raises -> Tuple[SIMD[DType.float32, 2], Float32]:
+    ) raises -> Float32:
         """Gradient of the clipped PPO loss over samples `start` onward of the
-        shuffle, left in `grad`; returns the log std gradient and the KL."""
+        shuffle, left in `grad`; returns the KL estimate."""
         var n = self.n
         var batch = self.batch
         var obs = mat[1](self.obs, len(self.obs))
@@ -185,17 +183,16 @@ struct Trainer:
         var o = mat[OUT](self.batch_acts.o, batch)
         var d3 = mat[OUT](self.d3, batch)
         var extra = mat[3](self.extra, batch)
+        var grad = mat[1](self.grad, P)
         var log_std = policy.log_std()
 
-        def gather[width: Int, alignment: Int = 1](c: Coord) {var}:
-            var b = Int(c[0].value())
+        def gather(b: Int) {var}:
             var s = permutation(start + b, n, shuffle)
             for r in range(IN):
                 x[r, b] = obs[0, (s // n * IN + r) * n + s % n]
 
-        def loss[width: Int, alignment: Int = 1](c: Coord) {var}:
+        def loss(b: Int) {var}:
             """Clipped surrogate and value loss derivatives for column b."""
-            var b = Int(c[0].value())
             var s = permutation(start + b, n, shuffle)
             var t = s // n
             var i = s % n
@@ -228,28 +225,28 @@ struct Trainer:
             d3[2, b] = 0.5 * derivative / Float32(batch)
             extra[2, b] = ratio - 1 - logratio
 
-        device.run(gather, Coord(batch))
-        policy.forward(device, x, self.batch_acts)
-        device.run(loss, Coord(batch))
-        policy.backward(device, x, self.batch_acts, d3, self.d2, self.d1, self.grad)
-        var tails = device.read(self.extra)
-        return (
-            SIMD[DType.float32, 2](sum(Span(tails)[0:batch]), sum(Span(tails)[batch : 2 * batch])),
-            mean(Span(tails)[2 * batch : 3 * batch]),
-        )
+        def log_std_gradient(a: Int) {var}:
+            var total: Float32 = 0
+            for b in range(batch):
+                total += extra[a, b]
+            grad[0, LOGSTD + a] = total
 
-    def adam(
-        mut self, device: Device, mut policy: Policy, dls: SIMD[DType.float32, 2], scale: Float32
-    ) raises:
+        device.run(gather, batch)
+        policy.forward(device, x, self.batch_acts)
+        device.run(loss, batch)
+        policy.backward(device, x, self.batch_acts, d3, self.d2, self.d1, self.grad)
+        device.run(log_std_gradient, 2)
+        return mean(Span(device.read(self.extra))[2 * batch :])
+
+    def adam(mut self, device: Device, mut policy: Policy, scale: Float32) raises:
         var step = self.step
         var theta = mat[1](policy.theta, P)
         var grad = mat[1](self.grad, P)
         var first = mat[1](self.first, P)
         var second = mat[1](self.second, P)
 
-        def kernel[width: Int, alignment: Int = 1](c: Coord) {var}:
-            var i = Int(c[0].value())
-            var g = (grad[0, i] if i < LOGSTD else dls[i - LOGSTD]) * scale
+        def kernel(i: Int) {var}:
+            var g = grad[0, i] * scale
             var m = 0.9 * first[0, i] + 0.1 * g
             var v = 0.999 * second[0, i] + 0.001 * g * g
             first[0, i] = m
@@ -259,7 +256,7 @@ struct Trainer:
             var value = theta[0, i] - LR * m_hat / (sqrt(v_hat) + 1e-5)
             theta[0, i] = min(max(value, -2), 0) if i >= LOGSTD else value
 
-        device.run(kernel, Coord(P))
+        device.run(kernel, P)
         policy.transpose(device)
 
     def save(
@@ -276,8 +273,8 @@ struct Trainer:
     def load(mut self, device: Device, values: List[Float32]) raises:
         """Restore the Adam state saved next to the weights (see `checkpoint`)."""
         self.step = Int(values[4])
-        device.write(self.first, slice(values, 5 + P, 5 + 2 * P))
-        device.write(self.second, slice(values, 5 + 2 * P, 5 + 3 * P))
+        device.write(self.first, Span(values)[5 + P : 5 + 2 * P])
+        device.write(self.second, Span(values)[5 + 2 * P : 5 + 3 * P])
 
 
 def checkpoint(device: Device, mut policy: Policy, path: String) raises -> List[Float32]:
@@ -289,20 +286,6 @@ def checkpoint(device: Device, mut policy: Policy, path: String) raises -> List[
         or values[1] != CHECKPOINT_VERSION
     ):
         raise Error("checkpoint format or network size does not match")
-    device.write(policy.theta, slice(values, 5, 5 + P))
+    device.write(policy.theta, Span(values)[5 : 5 + P])
     policy.transpose(device)
     return values^
-
-
-def squares(values: List[Float32]) -> Float32:
-    """Sum of squares of the weight gradient (the log std part is separate)."""
-    var total: Float32 = 0
-    for i in range(LOGSTD):
-        total += values[i] * values[i]
-    return total
-
-
-def slice(values: List[Float32], start: Int, stop: Int) -> List[Float32]:
-    var result = List[Float32](capacity=stop - start)
-    result.extend(Span(values)[start:stop])
-    return result^

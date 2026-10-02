@@ -8,12 +8,3 @@ dependencies = [
     "mojo==1.1.0",
     "max==26.6.0",
 ]
-
-[tool.pixi.workspace]
-channels = ["conda-forge"]
-platforms = ["osx-arm64"]
-
-[tool.pixi.pypi-dependencies]
-warporacer3d = { path = ".", editable = true }
-
-[tool.pixi.tasks]

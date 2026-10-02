@@ -1,4 +1,4 @@
-"""racer: compile maps, train and evaluate PPO drivers, and serve the viewer."""
+"""Racer: compile maps, train and evaluate PPO drivers, and serve the viewer."""
 from std.sys import argv
 from std.time import perf_counter
 from std.math import isfinite
@@ -79,14 +79,15 @@ def serve(
     print("http://127.0.0.1:" + String(port) + " (Ctrl+C to stop)", flush=True)
     var tick = 0
     while True:
+        # Request: steering% throttle% reset policy.
         var words = String(bridge.wait()).split()
-        var steering = Float32(Int(String(words[0]))) / 100
-        var throttle = Float32(Int(String(words[1]))) / 100
-        if Int(String(words[2])) > 0:
+        var steering = Float32(Int(words[0])) / 100
+        var throttle = Float32(Int(words[1])) / 100
+        if Int(words[2]) > 0:
             sim.spawn_all(device)
             sim.sense(device, mat[IN](sim.obs, sim.n))
         tick += 1
-        if Int(String(words[3])) > 0 and trained:
+        if Int(words[3]) > 0 and trained:
             act(device, sim, policy, acts, scratch, True, tick)
         else:
             var actions = List[Float32](length=sim.n, fill=steering)
@@ -112,7 +113,7 @@ def main() raises:
         return
     var mode = String(args[1])
     if mode == "prepare":
-        var resolution = Float64(String(args[4])) if len(args) > 4 else 0.025
+        var resolution = Float64(args[4]) if len(args) > 4 else 0.025
         var map = compile(load_track(String(args[2])), resolution)
         write_floats(String(args[3]), map)
         print(
@@ -126,8 +127,8 @@ def main() raises:
     var map_data = read_floats(String(args[2]))
     var choice = String(args[3]) if len(args) > 3 else String("auto")
     var gpu = GPU_AVAILABLE if choice == "auto" else choice == "gpu"
-    var n = Int(String(args[4])) if len(args) > 4 else 1024
-    var count = Int(String(args[5])) if len(args) > 5 else (8765 if mode == "serve" else 1000)
+    var n = Int(args[4]) if len(args) > 4 else 1024
+    var count = Int(args[5]) if len(args) > 5 else (8765 if mode == "serve" else 1000)
     var path = String(args[6]) if len(args) > 6 else String("agent.wrppo")
     var device = Device(gpu)
     print("Device:", device.ctx.name())

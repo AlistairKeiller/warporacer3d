@@ -8,11 +8,12 @@ by coarse cells for the lidar.
 """
 from std.math import floor, ceil, sqrt, cos, sin, atan2, pi
 from std.collections import Dict, Deque
+from std.os.path import dirname, join
 from std.pathlib import Path
 from std.python import Python
 from layout import TileTensor, Coord, row_major
 from layout.numpy import to_numpy, from_numpy
-from .map import MAGIC, VERSION, HEADER, SEGMENT, WALL
+from .map import MAGIC, VERSION, WALL, cross, dot, unit
 
 comptime Vec3 = SIMD[DType.float64, 4]
 comptime FAR = Float64(1e20)
@@ -22,29 +23,8 @@ comptime FREE = 230  # occupancy pixels at or above this are drivable
 
 
 @inline(.always)
-def vec3(x: Float64, y: Float64, z: Float64) -> Vec3:
-    var v = Vec3(0)
-    v[0], v[1], v[2] = x, y, z
-    return v
-
-
-@inline(.always)
-def cross(a: Vec3, b: Vec3) -> Vec3:
-    return vec3(
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    )
-
-
-@inline(.always)
-def norm(a: Vec3) -> Float64:
-    return sqrt((a * a).reduce_add())
-
-
-@inline(.always)
-def unit(a: Vec3) -> Vec3:
-    return a / max(norm(a), 1e-9)
+def corner(a: Vec3, b: Vec3, c: Vec3, i: Int) -> Vec3:
+    return a if i == 0 else (b if i == 1 else c)
 
 
 struct Mesh(Movable):
@@ -92,15 +72,12 @@ struct Route(Movable):
         if len(points) < 2:
             raise Error("a route needs at least two points")
         self.closed = closed
-        self.cumulative = List[Float64]()
-        self.cumulative.append(0)
+        self.cumulative = [0.0]
         for i in range(len(points) if closed else len(points) - 1):
-            self.cumulative.append(
-                self.cumulative[i] + norm(points[(i + 1) % len(points)] - points[i])
-            )
+            var d = points[(i + 1) % len(points)] - points[i]
+            self.cumulative.append(self.cumulative[i] + sqrt(dot(d, d)))
         if len(up) == 0:
-            for _ in range(len(points)):
-                up.append(vec3(0, 0, 1))
+            up = List[Vec3](length=len(points), fill=Vec3(0, 0, 1, 0))
         self.points = points^
         self.half_width = half_width^
         self.up = up^
@@ -170,9 +147,9 @@ def demo(kind: String) raises -> Track:
     for i in range(128):
         var t = 2 * pi * Float64(i) / 128
         var z = 0.7 * (1 - cos(2 * t)) if kind == "ramp" else 0.0
-        points.append(vec3(6 * cos(t), 6 * sin(t), z))
+        points.append(Vec3(6 * cos(t), 6 * sin(t), z, 0))
         if kind == "bank":
-            up.append(vec3(-0.25 * cos(t), -0.25 * sin(t), 1))
+            up.append(Vec3(-0.25 * cos(t), -0.25 * sin(t), 1, 0))
         widths.append(1.3)
     var route = Route(points^, widths^, up^, True)
     var parts = List[Mesh]()
@@ -188,16 +165,12 @@ def load_obj(path: String, obstacle: Bool) raises -> Mesh:
         var words = line.split()
         if len(words) >= 4 and words[0] == "v":
             vertices.append(
-                vec3(
-                    Float64(String(words[1])),
-                    Float64(String(words[2])),
-                    Float64(String(words[3])),
-                )
+                Vec3(Float64(words[1]), Float64(words[2]), Float64(words[3]), 0)
             )
         elif len(words) >= 4 and words[0] == "f":
             var polygon = List[Int]()
             for i in range(1, len(words)):
-                var index = Int(String(words[i].split("/")[0]))
+                var index = Int(words[i].split("/")[0])
                 polygon.append(index - 1 if index > 0 else len(vertices) + index)
             for i in range(1, len(polygon) - 1):
                 for index in [polygon[0], polygon[i], polygon[i + 1]]:
@@ -214,13 +187,9 @@ def load_route(path: String, closed: Bool) raises -> Route:
         if len(words) < 3:
             continue
         points.append(
-            vec3(
-                Float64(String(words[0])),
-                Float64(String(words[1])),
-                Float64(String(words[2])),
-            )
+            Vec3(Float64(words[0]), Float64(words[1]), Float64(words[2]), 0)
         )
-        widths.append(Float64(String(words[3])) if len(words) > 3 else 1.5)
+        widths.append(Float64(words[3]) if len(words) > 3 else 1.5)
     return Route(points^, widths^, List[Vec3](), closed)
 
 
@@ -241,17 +210,17 @@ def load_track(path: String) raises -> Track:
     if path == "flat" or path == "ramp" or path == "bank":
         return demo(path)
     var meta = parse_yaml(path)
-    var folder = String(path[byte = 0 : path.rfind("/") + 1])
+    var folder = dirname(path)
     if "image" in meta:
         return image_track(folder, meta)
     var closed = meta.get("closed", "true") != "false"
     var parts = List[Mesh]()
     for name in meta["mesh"].split(","):
-        parts.append(load_obj(folder + String(name.strip()), False))
+        parts.append(load_obj(join(folder, String(name.strip())), False))
     if "obstacles" in meta:
         for name in meta["obstacles"].split(","):
-            parts.append(load_obj(folder + String(name.strip()), True))
-    return Track(parts^, load_route(folder + meta["route"], closed))
+            parts.append(load_obj(join(folder, String(name.strip())), True))
+    return Track(parts^, load_route(join(folder, meta["route"]), closed))
 
 
 # ===-------------------------------------------------------------------=== #
@@ -278,8 +247,7 @@ struct Grid(TrivialRegisterPassable):
         var y0 = max(Int(floor((lo[1] - self.y0) / self.cell)) - 1, 0)
         var x1 = min(Int(ceil((hi[0] - self.x0) / self.cell)) + 2, self.nx)
         var y1 = min(Int(ceil((hi[1] - self.y0) / self.cell)) + 2, self.ny)
-        var orientation = cross(b - a, c - a)[2]
-        var sign: Float64 = 1 if orientation >= 0 else -1
+        var sign: Float64 = 1 if cross(b - a, c - a)[2] >= 0 else -1
         var result = List[Int]()
         for iy in range(y0, y1):
             for ix in range(x0, x1):
@@ -287,8 +255,8 @@ struct Grid(TrivialRegisterPassable):
                 var y = self.y0 + Float64(iy) * self.cell
                 var inside = True
                 for edge in range(3):
-                    var p = a if edge == 0 else (b if edge == 1 else c)
-                    var q = b if edge == 0 else (c if edge == 1 else a)
+                    var p = corner(a, b, c, edge)
+                    var q = corner(a, b, c, (edge + 1) % 3)
                     var dx = q[0] - p[0]
                     var dy = q[1] - p[1]
                     var margin = (
@@ -354,13 +322,13 @@ def intersection(f: List[Float64], q: Int, p: Int) -> Float64:
     return ((f[q] + Float64(q * q)) - (f[p] + Float64(p * p))) / Float64(2 * q - 2 * p)
 
 
-def edge_key(p: Vec3, q: Vec3) -> String:
-    """Order-independent key of an edge by its endpoints, quantized to 1 um."""
+def edge_key(p: Vec3, q: Vec3) -> SIMD[DType.int64, 4]:
+    """Order-independent key of an edge by its xy endpoints, quantized to 1 um."""
     var a = (p * 1e6).cast[DType.int64]()
     var b = (q * 1e6).cast[DType.int64]()
     if a[0] > b[0] or (a[0] == b[0] and a[1] > b[1]):
         a, b = b, a
-    return String(a[0], ",", a[1], ",", b[0], ",", b[1])
+    return SIMD[DType.int64, 4](a[0], a[1], b[0], b[1])
 
 
 # ===-------------------------------------------------------------------=== #
@@ -369,7 +337,7 @@ def edge_key(p: Vec3, q: Vec3) -> String:
 
 
 def compile(track: Track, resolution: Float64 = 0.025) raises -> List[Float32]:
-    var lo = vec3(FAR, FAR, FAR)
+    var lo = Vec3(FAR, FAR, FAR, 0)
     var hi = -lo
     for p in range(len(track.parts)):
         for v in track.parts[p].vertices:
@@ -385,9 +353,8 @@ def compile(track: Track, resolution: Float64 = 0.025) raises -> List[Float32]:
     var cells = grid.nx * grid.ny
     var height = List[Float32](length=cells, fill=0)
     var road = List[Bool](length=cells, fill=False)
-    var free = List[Bool](length=cells, fill=False)
     var corners = List[Vec3]()  # a, b, c of every collidable triangle
-    var edges = Dict[String, Int]()
+    var edges = Dict[SIMD[DType.int64, 4], Int]()
     var boundary = List[Vec3]()
     for p in range(len(track.parts)):
         ref part = track.parts[p]
@@ -409,8 +376,8 @@ def compile(track: Track, resolution: Float64 = 0.025) raises -> List[Float32]:
                 )
                 road[k] = True
             for edge in range(3):
-                var p = a if edge == 0 else (b if edge == 1 else c)
-                var q = b if edge == 0 else (c if edge == 1 else a)
+                var p = corner(a, b, c, edge)
+                var q = corner(a, b, c, (edge + 1) % 3)
                 var key = edge_key(p, q)
                 edges[key] = edges.get(key, 0) + 1
                 boundary.append(p)
@@ -419,15 +386,14 @@ def compile(track: Track, resolution: Float64 = 0.025) raises -> List[Float32]:
     var walls = Mesh(List[Vec3](), List[Int](), True)
     for i in range(0, len(boundary), 2):
         if edges[edge_key(boundary[i], boundary[i + 1])] == 1:
-            var up = vec3(0, 0, WALL)
+            var up = Vec3(0, 0, WALL, 0)
             quad(walls, boundary[i], boundary[i + 1], boundary[i + 1] + up, boundary[i] + up)
     for face in range(len(walls.faces) // 3):
         for which in range(3):
             corners.append(walls.corner(face, which))
     # Clearance: distance to the nearest cell that is off the road or that
     # any wall or obstacle overlaps (so even sub-cell walls block).
-    for k in range(cells):
-        free[k] = road[k]
+    var free = road.copy()
     var triangles = len(corners) // 3
     for t in range(triangles):
         var a = corners[3 * t]
@@ -711,11 +677,11 @@ def longest_loop(
 
 def image_track(folder: String, meta: Dict[String, String]) raises -> Track:
     var pixels = List[UInt8]()
-    var w, h = load_image(folder + meta["image"], pixels)
+    var w, h = load_image(join(folder, meta["image"]), pixels)
     var resolution = Float64(meta["resolution"])
     var origin = meta["origin"].replace("[", " ").replace("]", " ").replace(",", " ").split()
-    var ox = Float64(String(origin[0]))
-    var oy = Float64(String(origin[1]))
+    var ox = Float64(origin[0])
+    var oy = Float64(origin[1])
     var free = List[Bool](capacity=w * h)
     for value in pixels:
         free.append(Int(value) >= FREE)
@@ -735,7 +701,7 @@ def image_track(folder: String, meta: Dict[String, String]) raises -> Track:
             var i = loop[((k + offset) % count + count) % count]
             x += ox + Float64(i % w) * resolution
             y += oy + Float64(h - 1 - i // w) * resolution
-        points.append(vec3(x / 51, y / 51, 0))
+        points.append(Vec3(x / 51, y / 51, 0, 0))
         var i = loop[k]
         widths.append(max(sqrt(squared[i]) * resolution, 0.1))
     var route = Route(points^, widths^, List[Vec3](), True)
@@ -745,10 +711,10 @@ def image_track(folder: String, meta: Dict[String, String]) raises -> Track:
     var floor = Mesh(List[Vec3](), List[Int]())
     quad(
         floor,
-        vec3(x0, y0, 0),
-        vec3(x0 + Float64(w) * resolution, y0, 0),
-        vec3(x0 + Float64(w) * resolution, y0 + Float64(h) * resolution, 0),
-        vec3(x0, y0 + Float64(h) * resolution, 0),
+        Vec3(x0, y0, 0, 0),
+        Vec3(x0 + Float64(w) * resolution, y0, 0, 0),
+        Vec3(x0 + Float64(w) * resolution, y0 + Float64(h) * resolution, 0, 0),
+        Vec3(x0, y0 + Float64(h) * resolution, 0, 0),
     )
     var walls = Mesh(List[Vec3](), List[Int](), True)
     for r in range(h):
@@ -762,13 +728,14 @@ def image_track(folder: String, meta: Dict[String, String]) raises -> Track:
                 var nc = c + dc
                 if nr >= 0 and nr < h and nc >= 0 and nc < w and free[nr * w + nc]:
                     continue
-                var centre = vec3(
+                var centre = Vec3(
                     ox + (Float64(c) + Float64(dc) / 2) * resolution,
                     oy + (Float64(h - 1 - r) - Float64(dr) / 2) * resolution,
                     0,
+                    0,
                 )
-                var along = vec3(Float64(dr), Float64(dc), 0) * (resolution / 2)
-                var up = vec3(0, 0, WALL)
+                var along = Vec3(Float64(dr), Float64(dc), 0, 0) * (resolution / 2)
+                var up = Vec3(0, 0, WALL, 0)
                 quad(walls, centre - along, centre + along, centre + along + up, centre - along + up)
     var parts = List[Mesh]()
     parts.append(floor^)

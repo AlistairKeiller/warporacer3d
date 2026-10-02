@@ -3,23 +3,21 @@
     uv run mojo -I . tests/test_mojo.mojo [cpu]
 """
 from std.sys import argv
-from std.math import isfinite, exp, log, tanh, sqrt, cos, sin
-from layout import Coord, Idx
-from racer.device import Device, Buffer, Mat, mat, GPU_AVAILABLE
+from std.math import isfinite, exp, log, tanh, cos, sin
+from racer.device import Device, Buffer, mat, GPU_AVAILABLE
 from racer.vehicle import Car, frame, integrate
-from racer.map import Map, HEADER
+from racer.map import Map
 from racer.compile import (
     Mesh,
     Route,
     Track,
     Vec3,
-    vec3,
     quad,
     demo,
     compile,
 )
-from racer.simulation import Sim, STATE, OBS, IN, OUT, X, Y, EPISODE, STEPS, CRASH, FINISH
-from racer.network import Policy, Activations, P, H, HA, W0, W1, W2, LOGSTD
+from racer.simulation import Sim, OBS, IN, OUT, X, EPISODE, STEPS, CRASH, FINISH
+from racer.network import Policy, P, H, HA, W0, W1, W2, LOGSTD
 from racer.ppo import Trainer, ROLLOUT, MINIBATCHES, permutation
 from racer.lidar import BEAMS, RANGE, MOUNT_FORWARD
 
@@ -101,12 +99,12 @@ def device_copy(data: List[Float32]) raises -> Buffer:
 def arena(width: Float64, wall_x: Float64) raises -> List[Float32]:
     """An open floor with a thin wall across the middle and a straight route."""
     var floor = Mesh(List[Vec3](), List[Int]())
-    quad(floor, vec3(-4, -3, 0), vec3(4, -3, 0), vec3(4, 3, 0), vec3(-4, 3, 0))
+    quad(floor, Vec3(-4, -3, 0, 0), Vec3(4, -3, 0, 0), Vec3(4, 3, 0, 0), Vec3(-4, 3, 0, 0))
     var wall = Mesh(List[Vec3](), List[Int](), True)
-    quad(wall, vec3(wall_x, -3, 0), vec3(wall_x, 3, 0), vec3(wall_x, 3, 0.6), vec3(wall_x, -3, 0.6))
+    quad(wall, Vec3(wall_x, -3, 0, 0), Vec3(wall_x, 3, 0, 0), Vec3(wall_x, 3, 0.6, 0), Vec3(wall_x, -3, 0.6, 0))
     var points = List[Vec3]()
-    points.append(vec3(-3, 0, 0))
-    points.append(vec3(3, 0, 0))
+    points.append(Vec3(-3, 0, 0, 0))
+    points.append(Vec3(3, 0, 0, 0))
     var widths = List[Float64]()
     widths.append(width)
     widths.append(width)
@@ -282,24 +280,18 @@ def host_loss(w: List[Float64], trainer: Trainer, device: Device) raises -> Floa
     return total
 
 
-def gradient(
-    device: Device, mut policy: Policy, mut trainer: Trainer
-) raises -> Tuple[List[Float32], SIMD[DType.float32, 2]]:
+def gradient(device: Device, mut policy: Policy, mut trainer: Trainer) raises -> List[Float32]:
     """One minibatch's analytic gradient via the trainer's own kernels."""
     fixture(device, trainer)
-    var dls, _ = trainer.minibatch(device, policy, 0, 0, 0, 1)
-    return (device.read(trainer.grad), dls)
+    _ = trainer.minibatch(device, policy, 0, 0, 0, 1)
+    return device.read(trainer.grad)
 
 
 def gradient_tests(gpu: Bool) raises:
     var cpu = Device(False)
     var policy = Policy(cpu, 42)
     var trainer = Trainer(cpu, GRAD_N)
-    var result = gradient(cpu, policy, trainer)
-    var analytic = result[0].copy()
-    var dls = result[1]
-    analytic[LOGSTD] = dls[0]
-    analytic[LOGSTD + 1] = dls[1]
+    var analytic = gradient(cpu, policy, trainer)
     var weights = List[Float64]()
     for value in cpu.read(policy.theta):
         weights.append(Float64(value))
@@ -336,8 +328,8 @@ def gradient_tests(gpu: Bool) raises:
         var scale: Float32 = 0
         for value in analytic:
             scale = max(scale, abs(value))
-        for k in range(LOGSTD):
-            check(abs(fast[0][k] - analytic[k]) <= 2e-2 * scale + 1e-5, "CPU/GPU gradients agree")
+        for k in range(P):
+            check(abs(fast[k] - analytic[k]) <= 2e-2 * scale + 1e-5, "CPU/GPU gradients agree")
         print("CPU/GPU gradients agree (GPU fp32 matmul may be TF32-like)")
 
 

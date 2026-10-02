@@ -67,7 +67,7 @@ analytic PPO gradient against central finite differences.
 |---|---|
 | `main.mojo` | CLI: prepare, train, eval, benchmark, serve |
 | `racer/device.mojo` | `Device`: buffers, matrix views, `run` (MAX elementwise) and `gemm` (MAX matmul) |
-| `racer/map.mojo` | `.wrmap` header and bilinear surface / route projection used by kernels |
+| `racer/map.mojo` | `.wrmap` header, bilinear surface / route projection used by kernels, shared vector helpers |
 | `racer/vehicle.mojo`, `lidar.mojo` | bicycle dynamics; 270-degree planar lidar over coarse-cell triangle lists |
 | `racer/simulation.mojo` | `Sim`: spawn, physics with rewards and resets, sensing, action sampling |
 | `racer/network.mojo` | `Policy`: tanh MLP forward and backward as matmuls with epilogues |

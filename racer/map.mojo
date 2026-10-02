@@ -14,6 +14,25 @@ comptime SEGMENT = 9  # px, py, pz, dx, dy, dz, cumulative distance, half width,
 comptime WALL = 0.5  # metres; every road boundary edge becomes a wall this tall
 
 
+# 3-vectors are 4-lane SIMD with a zero fourth lane, in float32 for kernels
+# and float64 for the compiler.
+@inline(.always)
+def cross[dt: DType](a: SIMD[dt, 4], b: SIMD[dt, 4]) -> SIMD[dt, 4]:
+    return a.shuffle[1, 2, 0, 3]() * b.shuffle[2, 0, 1, 3]() - a.shuffle[
+        2, 0, 1, 3
+    ]() * b.shuffle[1, 2, 0, 3]()
+
+
+@inline(.always)
+def dot[dt: DType](a: SIMD[dt, 4], b: SIMD[dt, 4]) -> Scalar[dt]:
+    return (a * b).reduce_add()
+
+
+@inline(.always)
+def unit[dt: DType](a: SIMD[dt, 4]) -> SIMD[dt, 4]:
+    return a / max(sqrt(dot(a, a)), 1e-9)
+
+
 @fieldwise_init
 struct Surface(TrivialRegisterPassable):
     var clearance: Float32  # signed distance to the nearest wall or road edge
@@ -79,23 +98,23 @@ struct Map(TrivialRegisterPassable):
         var tx = fx - Float32(ix)
         var ty = fy - Float32(iy)
         var k = iy * self.nx + ix
-        var h00 = d[0, self.height + k]
-        var h10 = d[0, self.height + k + 1]
-        var h01 = d[0, self.height + k + self.nx]
-        var h11 = d[0, self.height + k + self.nx + 1]
-        var c00 = d[0, HEADER + k]
-        var c10 = d[0, HEADER + k + 1]
-        var c01 = d[0, HEADER + k + self.nx]
-        var c11 = d[0, HEADER + k + self.nx + 1]
-        var w00 = (1 - tx) * (1 - ty)
-        var w10 = tx * (1 - ty)
-        var w01 = (1 - tx) * ty
-        var w11 = tx * ty
+        # Corners (00, 10, 01, 11) of the clearance and height patches.
+        var c = SIMD[DType.float32, 4](
+            d[0, HEADER + k], d[0, HEADER + k + 1],
+            d[0, HEADER + k + self.nx], d[0, HEADER + k + self.nx + 1],
+        )
+        var h = SIMD[DType.float32, 4](
+            d[0, self.height + k], d[0, self.height + k + 1],
+            d[0, self.height + k + self.nx], d[0, self.height + k + self.nx + 1],
+        )
+        var w = SIMD[DType.float32, 4](
+            (1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty
+        )
         return Surface(
-            c00 * w00 + c10 * w10 + c01 * w01 + c11 * w11,
-            h00 * w00 + h10 * w10 + h01 * w01 + h11 * w11,
-            ((h10 - h00) * (1 - ty) + (h11 - h01) * ty) / self.cell,
-            ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) / self.cell,
+            dot(c, w),
+            dot(h, w),
+            ((h[1] - h[0]) * (1 - ty) + (h[3] - h[2]) * ty) / self.cell,
+            ((h[2] - h[0]) * (1 - tx) + (h[3] - h[1]) * tx) / self.cell,
         )
 
     @inline(.always)
@@ -134,4 +153,3 @@ struct Map(TrivialRegisterPassable):
                 result[2] = sqrt(dist)
                 result[3] = self.segment(d, i, 7)
         return result
-

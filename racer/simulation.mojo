@@ -4,9 +4,8 @@ and Gaussian action sampling from a policy output.
 State is one row per quantity and one column per car (feature-major), the
 same layout the network uses, so the viewer snapshots rows directly.
 """
-from std.math import sqrt, exp, log
+from std.math import sqrt, exp
 from std.random.philox import Random, NormalRandom
-from layout import Coord, Idx
 from .device import Device, Buffer, Mat, mat
 from .map import Map
 from .vehicle import Car, frame, integrate, DT, SUBSTEPS
@@ -160,41 +159,37 @@ struct Sim:
         self.reward = device.alloc(n)
         self.done = device.alloc(n)
 
-    def terrain_view(mut self) -> Mat[1]:
-        return mat[1](self.terrain, len(self.terrain))
-
     def spawn_all(mut self, device: Device) raises:
         var s = mat[STATE](self.state, self.n)
-        var d = self.terrain_view()
+        var d = mat[1](self.terrain, len(self.terrain))
         var map = self.map
         var seed = self.seed
 
-        def kernel[width: Int, alignment: Int = 1](c: Coord) {var}:
-            spawn(s, map, d, Int(c[0].value()), seed)
+        def kernel(i: Int) {var}:
+            spawn(s, map, d, i, seed)
 
-        device.run(kernel, Coord(self.n))
+        device.run(kernel, self.n)
 
     def physics(
         mut self, device: Device, actions: Mat[2], reward: Mat[1], done: Mat[1]
     ) raises:
         var s = mat[STATE](self.state, self.n)
-        var d = self.terrain_view()
+        var d = mat[1](self.terrain, len(self.terrain))
         var map = self.map
         var seed = self.seed
 
-        def kernel[width: Int, alignment: Int = 1](c: Coord) {var}:
-            advance(s, actions, reward, done, map, d, Int(c[0].value()), seed)
+        def kernel(i: Int) {var}:
+            advance(s, actions, reward, done, map, d, i, seed)
 
-        device.run(kernel, Coord(self.n))
+        device.run(kernel, self.n)
 
     def sense(mut self, device: Device, obs: Mat[IN]) raises:
         """Proprioception and one lidar scan per car into `obs`."""
         var s = mat[STATE](self.state, self.n)
-        var d = self.terrain_view()
+        var d = mat[1](self.terrain, len(self.terrain))
         var map = self.map
 
-        def proprio[width: Int, alignment: Int = 1](c: Coord) {var}:
-            var i = Int(c[0].value())
+        def proprio(i: Int) {var}:
             var ground = map.surface(d, s[X, i], s[Y, i])
             var f = frame(s[HEADING, i], ground.sx, ground.sy)
             obs[0, i] = s[STEER, i] / 0.4189
@@ -207,16 +202,14 @@ struct Sim:
             obs[7, i] = min(ground.clearance, 2) / 2
             obs[OBS, i] = 1
 
-        def lidar[width: Int, alignment: Int = 1](c: Coord) {var}:
-            var i = Int(c[0].value())
-            var beam = Int(c[1].value())
+        def lidar(i: Int, beam: Int) {var}:
             var ground = map.surface(d, s[X, i], s[Y, i])
             var f = frame(s[HEADING, i], ground.sx, ground.sy)
             var origin = mount(s[X, i], s[Y, i], ground.height, f)
             obs[8 + beam, i] = ray(map, d, origin, direction(beam, f)) / RANGE
 
-        device.run(proprio, Coord(self.n))
-        device.run(lidar, Coord(self.n, Idx[BEAMS]))
+        device.run(proprio, self.n)
+        device.run(lidar, self.n, BEAMS)
 
     def sample(
         mut self,
@@ -233,8 +226,7 @@ struct Sim:
         probabilities and the critic's value estimates."""
         var seed = self.seed
 
-        def kernel[width: Int, alignment: Int = 1](c: Coord) {var}:
-            var i = Int(c[0].value())
+        def kernel(i: Int) {var}:
             var rng = NormalRandom(
                 seed=UInt64(seed) + 1, subsequence=UInt64(i), offset=UInt64(step)
             )
@@ -248,4 +240,4 @@ struct Sim:
             logp[0, i] = probability
             value[0, i] = output[2, i]
 
-        device.run(kernel, Coord(self.n))
+        device.run(kernel, self.n)

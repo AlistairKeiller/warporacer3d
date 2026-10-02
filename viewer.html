@@ -90,6 +90,10 @@
       color: #78dbb6;
       min-height: 20px;
     }
+    :focus-visible {
+      outline: 2px solid #78dbb6;
+      outline-offset: 2px;
+    }
     footer {
       position: absolute;
       bottom: 18px;
@@ -119,7 +123,7 @@
       }
     }
   </style>
-  <canvas id="view"></canvas>
+  <canvas id="view" aria-label="Track with live cars; drag to orbit, scroll to zoom"></canvas>
   <aside>
     <h1>WarpORacer <small>Mojo</small></h1>
     <div class="muted" id="map">Loading terrain…</div>
@@ -167,8 +171,8 @@
       <dt>Resets / finishes</dt>
       <dd id="events">0 / 0</dd>
     </dl>
-    <div id="status">Starting simulation…</div>
-    <div id="error"></div>
+    <div id="status" aria-live="polite">Starting simulation…</div>
+    <div id="error" aria-live="polite"></div>
     <p class="muted">W/S or ↑/↓: throttle<br />A/D or ←/→: steer<br />Space: pause · R: reset</p>
     <small>Drag to orbit · Scroll to zoom<br />Walls end an episode.</small>
   </aside>
@@ -326,9 +330,9 @@
         sy: ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) / g.cell,
       };
     }
-    // Snapshots are feature-major: row k of state, then observations, actions, reward, done.
+    // Snapshots are feature-major: the state rows, then observations, actions, reward, done.
     const row = (k) => k * scene.cars;
-    const obsRow = (r) => (scene.state + r) * scene.cars;
+    const BEAM = scene.state + 8, THROTTLE = scene.state + scene.obs + 1, DONE = THROTTLE + 2;
     const routeVertices = [];
     for (let i = 3; i < scene.route.length + (scene.closed ? 3 : 0); i += 3) {
       const a = scene.route.slice(i - 3, i),
@@ -516,7 +520,7 @@
             origin = add(p, add(scale(f, scene.mount[0]), scale(up, scene.mount[2])));
           for (let b = 0; b < scene.beams; b++) {
             const azimuth = -Math.PI * 0.75 + (b * Math.PI * 1.5) / (scene.beams - 1),
-              distance = state[obsRow(8 + b) + i] * scene.range,
+              distance = state[row(BEAM + b) + i] * scene.range,
               direction = add(scale(f, Math.cos(azimuth)), scale(left, Math.sin(azimuth)));
             beams.push(...origin, ...add(origin, scale(direction, distance)));
           }
@@ -525,11 +529,10 @@
         $("speed").textContent = Math.hypot(s[3], s[4]).toFixed(2) + " m/s";
         $("grade").textContent =
           ((Math.asin(f[2]) * 180) / Math.PI).toFixed(1) + "° / " + p[2].toFixed(2) + " m";
-        const throttleAt = scene.cars * (scene.state + scene.obs + 1) + i;
         $("control").textContent =
           ((s[6] * 180) / Math.PI).toFixed(1) +
           "° / " +
-          Math.max(-1, Math.min(1, state[throttleAt])).toFixed(2);
+          Math.max(-1, Math.min(1, state[row(THROTTLE) + i])).toFixed(2);
         $("reward").textContent = s[12].toFixed(2);
         $("progress").textContent = s[7].toFixed(1) + " m";
         $("events").textContent = totalResets + " / " + totalFinishes;
@@ -571,7 +574,7 @@
           }
           trails[i].push(add(p, [0, 0, 0.025]));
           if (trails[i].length > 240) trails[i].shift();
-          if (state[scene.cars * (scene.state + scene.obs + 3) + i] === 3) totalFinishes++;
+          if (state[row(DONE) + i] === 3) totalFinishes++;
         }
         $("status").textContent = paused
           ? "Paused"
