@@ -2,9 +2,11 @@
 
 Buffers are flat float32 device memory; `mat` views them as row-major
 matrices with a static row count. Kernels are plain closures called once per
-index by MAX's `elementwise`; matrix products go through MAX's `matmul`.
+index by MAX's `elementwise`, matrix products go through MAX's `matmul`, and
+`sum` reduces a row in a fixed order.
 """
 from std.sys import has_accelerator, get_defined_bool
+from std.pathlib import Path
 from layout import TileTensor, Coord, Idx, row_major, ComptimeInt
 from layout.tile_layout import RowMajorLayout
 from linalg.matmul import matmul
@@ -22,12 +24,14 @@ comptime Mat[rows: Int] = TileTensor[
 comptime Kernel = ImplicitlyCopyable & RegisterPassable & def(Int) -> None
 comptime Kernel2 = ImplicitlyCopyable & RegisterPassable & def(Int, Int) -> None
 comptime Epilogue = Optional[elementwise_compute_lambda_type]
+comptime CHUNKS = 256  # partial sums of `Device.sum`
 
 
-def mat[rows: Int](mut buffer: Buffer, cols: Int, offset: Int = 0) -> Mat[rows]:
+def mat[rows: Int](buffer: Buffer, cols: Int, offset: Int = 0) -> Mat[rows]:
     """A `rows` x `cols` row-major view starting `offset` floats into `buffer`."""
     return TileTensor(
         ptr=buffer.unsafe_ptr()
+        .unsafe_mut_cast[True]()
         .unsafe_origin_cast[MutAnyOrigin]()
         .unsafe_offset(offset),
         layout=row_major(Coord(Idx[rows], cols)),
@@ -37,6 +41,7 @@ def mat[rows: Int](mut buffer: Buffer, cols: Int, offset: Int = 0) -> Mat[rows]:
 struct Device(Movable):
     var ctx: DeviceContext
     var gpu: Bool
+    var partials: Buffer  # [CHUNKS] scratch for `sum`
 
     def __init__(out self, gpu: Bool) raises:
         comptime if GPU_AVAILABLE:
@@ -46,6 +51,7 @@ struct Device(Movable):
                 raise Error("GPU support is unavailable in this build; use cpu")
             self.ctx = DeviceContext(api="cpu")
         self.gpu = gpu
+        self.partials = self.ctx.enqueue_create_buffer[DType.float32](CHUNKS)
 
     def alloc(self, count: Int) raises -> Buffer:
         """A zeroed buffer. The fill is waited for: on the CPU, kernels run on
@@ -105,6 +111,32 @@ struct Device(Movable):
             target="cpu",
         ](c, a, b, Optional(self.ctx))
 
+    def sum[
+        squared: Bool = False
+    ](self, x: Mat[1], into: Mat[1], slot: Int, shift: Float32 = 0) raises:
+        """into[0, slot] = sum over the row vector x of (x - shift), or of its
+        square. Two fixed-order passes (CHUNKS strided partial sums, then one
+        thread adds them): deterministic on every device, unlike MAX 26.6's
+        GPU `reduction.sum`, which returned partial sums on Metal."""
+        var n = Int(x.dim[1]())
+        var partials = mat[1](self.partials, CHUNKS)
+
+        def partial(c: Int) {var}:
+            var total: Float32 = 0
+            for k in range(c, n, CHUNKS):
+                var v = x[0, k] - shift
+                total += v * v if squared else v
+            partials[0, c] = total
+
+        def final(_i: Int) {var}:
+            var total: Float32 = 0
+            for c in range(CHUNKS):
+                total += partials[0, c]
+            into[0, slot] = total
+
+        self.run(partial, CHUNKS)
+        self.run(final, 1)
+
     def read(self, buffer: Buffer) raises -> List[Float32]:
         var result = List[Float32](length=len(buffer), fill=0)
         self.ctx.enqueue_copy(result.unsafe_ptr(), buffer)
@@ -122,7 +154,7 @@ struct Device(Movable):
 
 
 def read_floats(path: String) raises -> List[Float32]:
-    var raw = open(path, "r").read_bytes()
+    var raw = Path(path).read_bytes()
     return List(
         Span(
             unsafe_ptr=raw.unsafe_ptr().unsafe_bitcast[Float32](),
@@ -132,11 +164,9 @@ def read_floats(path: String) raises -> List[Float32]:
 
 
 def write_floats(path: String, values: Span[Float32, _]) raises:
-    var file = open(path, "w")
-    file.write_all(
+    Path(path).write_bytes(
         Span(
             unsafe_ptr=values.unsafe_ptr().unsafe_bitcast[UInt8](),
             length=len(values) * 4,
         )
     )
-    file.close()

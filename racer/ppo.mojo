@@ -1,13 +1,13 @@
 """Rollouts, GAE, the clipped PPO objective, and Adam, all on the device.
 
-Scalar statistics (advantage moments, gradient norm, KL) are reduced on the
-host; everything per sample or per weight runs as a kernel.
+Everything per sample or per weight runs as a kernel; scalar statistics
+(reward and advantage moments, gradient norm, KL) are `Device.sum` reductions
+into a small `stats` buffer, so an iteration reads the host only to print.
 """
-from std.math import exp, sqrt
+from std.math import exp, sqrt, clamp
 from std.random.philox import Random
-from max.algorithm.reduction import mean, variance
 from .device import Device, Buffer, mat, read_floats, write_floats
-from .simulation import Sim, IN, OUT
+from .simulation import Sim, IN, OUT, HALF_LOG_2PI
 from .network import Policy, Activations, P, LOGSTD, HA
 
 comptime ROLLOUT = 32
@@ -20,6 +20,13 @@ comptime LR = Float32(3e-4)
 comptime MAX_NORM = Float32(0.5)
 comptime CHECKPOINT_MAGIC = 271828
 comptime CHECKPOINT_VERSION = 4
+# Slots of the device-side `stats` buffer.
+comptime REWARD = 0  # sum of rewards over the rollout
+comptime ADV = 1  # sum of advantages
+comptime ADV_SQ = 2  # sum of squared, centred advantages
+comptime NORM = 3  # squared gradient norm of the current minibatch
+comptime KL = 4  # sum of the per-sample KL estimates of the last minibatch
+comptime STATS = 5
 
 
 def permutation(index: Int, n: Int, seed: Int) -> Int:
@@ -57,6 +64,7 @@ struct Trainer:
     var grad: Buffer  # [P]
     var first: Buffer  # [P] Adam moments
     var second: Buffer
+    var stats: Buffer  # [STATS] device-side scalars
 
     def __init__(out self, device: Device, n: Int) raises:
         self.n = n
@@ -80,9 +88,10 @@ struct Trainer:
         self.grad = device.alloc(P)
         self.first = device.alloc(P)
         self.second = device.alloc(P)
+        self.stats = device.alloc(STATS)
 
     def rollout(
-        mut self, device: Device, mut sim: Sim, mut policy: Policy, iteration: Int
+        self, device: Device, mut sim: Sim, policy: Policy, iteration: Int
     ) raises -> Float32:
         """ROLLOUT steps of every car; returns the mean reward per step."""
         var n = self.n
@@ -115,9 +124,10 @@ struct Trainer:
 
         device.run(bootstrap, n)
         self.gae(device)
-        return mean(Span(device.read(self.reward)))
+        device.sum(mat[1](self.reward, ROLLOUT * n), mat[1](self.stats, STATS), REWARD)
+        return device.read(self.stats)[REWARD] / Float32(ROLLOUT * n)
 
-    def gae(mut self, device: Device) raises:
+    def gae(self, device: Device) raises:
         """Generalized advantage estimates and value targets per car."""
         var n = self.n
         var reward = mat[1](self.reward, ROLLOUT * n)
@@ -141,36 +151,43 @@ struct Trainer:
         device.run(kernel, n)
 
     def update(
-        mut self, device: Device, mut policy: Policy, iteration: Int
+        mut self, device: Device, policy: Policy, iteration: Int
     ) raises -> Float32:
-        """EPOCHS passes of clipped PPO over shuffled minibatches; returns KL."""
-        var adv = device.read(self.advantage)
-        var adv_mean = mean(Span(adv))
-        var adv_scale = 1 / sqrt(max(variance(Span(adv), adv_mean, 0), 1e-8))
-        var kl: Float32 = 0
+        """EPOCHS passes of clipped PPO over shuffled minibatches; returns the
+        KL estimate of the last minibatch."""
+        var samples = ROLLOUT * self.n
+        var batch = self.batch
+        var stats = mat[1](self.stats, STATS)
+        var advantage = mat[1](self.advantage, samples)
+        # Two passes (the mean, then centred squares) keep the variance exact
+        # in float32 even when the advantages are far from zero.
+        device.sum(advantage, stats, ADV)
+        var adv_mean = device.read(self.stats)[ADV] / Float32(samples)
+        device.sum[squared=True](advantage, stats, ADV_SQ, shift=adv_mean)
+        var adv_var = device.read(self.stats)[ADV_SQ] / Float32(samples)
+        var adv_scale = 1 / sqrt(max(adv_var, 1e-8))
         for epoch in range(EPOCHS):
             for m in range(MINIBATCHES):
-                kl = self.minibatch(
-                    device, policy, m * self.batch, 1000003 * iteration + 7 * epoch, adv_mean, adv_scale
+                self.minibatch(
+                    device, policy, m * batch, 1000003 * iteration + 7 * epoch, adv_mean, adv_scale
                 )
-                var norm: Float32 = 0
-                for g in device.read(self.grad):
-                    norm += g * g
                 self.step += 1
-                self.adam(device, policy, min(Float32(1), MAX_NORM / (sqrt(norm) + 1e-8)))
-        return kl
+                self.adam(device, policy)
+        # `extra` still holds the last minibatch; its KL row is the estimate.
+        device.sum(mat[1](self.extra, batch, 2 * batch), stats, KL)
+        return device.read(self.stats)[KL] / Float32(batch)
 
     def minibatch(
-        mut self,
+        self,
         device: Device,
-        mut policy: Policy,
+        policy: Policy,
         start: Int,
         shuffle: Int,
         adv_mean: Float32,
         adv_scale: Float32,
-    ) raises -> Float32:
+    ) raises:
         """Gradient of the clipped PPO loss over samples `start` onward of the
-        shuffle, left in `grad`; returns the KL estimate."""
+        shuffle, left in `grad` with its squared norm in `stats`."""
         var n = self.n
         var batch = self.batch
         var obs = mat[1](self.obs, len(self.obs))
@@ -203,7 +220,7 @@ struct Trainer:
                 error[a] = actions[0, (t * 2 + a) * n + i] - o[a, b]
                 invvar[a] = exp(-2 * log_std[0, a])
                 new_logp -= (
-                    0.5 * error[a] * error[a] * invvar[a] + log_std[0, a] + 0.918938533
+                    0.5 * error[a] * error[a] * invvar[a] + log_std[0, a] + HALF_LOG_2PI
                 )
             var logratio = new_logp - logp[0, s]
             var ratio = exp(logratio)
@@ -216,7 +233,7 @@ struct Trainer:
                 extra[a, b] = dlogp * (error[a] * error[a] * invvar[a] - 1)
             var value = o[2, b]
             var old = values[0, s]
-            var clipped = old + min(max(value - old, -CLIP), CLIP)
+            var clipped = old + clamp(value - old, -CLIP, CLIP)
             var delta = value - target[0, s]
             var clipped_delta = clipped - target[0, s]
             var derivative = delta
@@ -225,27 +242,27 @@ struct Trainer:
             d3[2, b] = 0.5 * derivative / Float32(batch)
             extra[2, b] = ratio - 1 - logratio
 
-        def log_std_gradient(a: Int) {var}:
-            var total: Float32 = 0
-            for b in range(batch):
-                total += extra[a, b]
-            grad[0, LOGSTD + a] = total
-
         device.run(gather, batch)
         policy.forward(device, x, self.batch_acts)
         device.run(loss, batch)
         policy.backward(device, x, self.batch_acts, d3, self.d2, self.d1, self.grad)
-        device.run(log_std_gradient, 2)
-        return mean(Span(device.read(self.extra))[2 * batch :])
+        # The log std gradient is the row sum of `extra`. (Two reductions, not
+        # a 1 x 2 matmul: MAX 26.6's Metal matmul misbehaves on tiny shapes.)
+        for a in range(2):
+            device.sum(mat[1](self.extra, batch, a * batch), grad, LOGSTD + a)
+        device.sum[squared=True](grad, mat[1](self.stats, STATS), NORM)
 
-    def adam(mut self, device: Device, mut policy: Policy, scale: Float32) raises:
+    def adam(self, device: Device, policy: Policy) raises:
+        """One Adam step with the gradient clipped to MAX_NORM."""
         var step = self.step
         var theta = mat[1](policy.theta, P)
         var grad = mat[1](self.grad, P)
         var first = mat[1](self.first, P)
         var second = mat[1](self.second, P)
+        var stats = mat[1](self.stats, STATS)
 
         def kernel(i: Int) {var}:
+            var scale = min(Float32(1), MAX_NORM / (sqrt(stats[0, NORM]) + 1e-8))
             var g = grad[0, i] * scale
             var m = 0.9 * first[0, i] + 0.1 * g
             var v = 0.999 * second[0, i] + 0.001 * g * g
@@ -260,7 +277,7 @@ struct Trainer:
         policy.transpose(device)
 
     def save(
-        self, device: Device, mut policy: Policy, path: String, iteration: Int
+        self, device: Device, policy: Policy, path: String, iteration: Int
     ) raises:
         var values = List[Float32]()
         for value in [CHECKPOINT_MAGIC, CHECKPOINT_VERSION, P, iteration, self.step]:
@@ -277,7 +294,7 @@ struct Trainer:
         device.write(self.second, Span(values)[5 + 2 * P : 5 + 3 * P])
 
 
-def checkpoint(device: Device, mut policy: Policy, path: String) raises -> List[Float32]:
+def checkpoint(device: Device, policy: Policy, path: String) raises -> List[Float32]:
     """Load a checkpoint into the policy; returns it so a Trainer can resume."""
     var values = read_floats(path)
     if (

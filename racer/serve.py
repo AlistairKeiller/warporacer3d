@@ -5,13 +5,14 @@ POST /step hands its body to Mojo through a queue and answers with whatever
 Mojo replies (a binary state snapshot).
 """
 import http.server
+import json
 import queue
 import threading
 
 
 class Bridge:
     def __init__(self, port, page, info, map_bytes):
-        page, info = page.encode(), info.encode()
+        page, info = page.encode(), json.dumps(info).encode()
         self.requests = queue.Queue()
         self.replies = queue.Queue()
         self.lock = threading.Lock()

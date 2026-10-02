@@ -330,6 +330,16 @@
         sy: ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) / g.cell,
       };
     }
+    function attitude(x, y, heading) {
+      // Height and slope from the ground under the four wheels (racer/simulation.mojo
+      // `attitude`); AXLE and TRACK match racer/vehicle.mojo.
+      const AXLE = 0.1651, TRACK = 0.37, c = Math.cos(heading), s = Math.sin(heading),
+        front = surface(x + AXLE * c, y + AXLE * s).z, rear = surface(x - AXLE * c, y - AXLE * s).z,
+        left = surface(x - 0.5 * TRACK * s, y + 0.5 * TRACK * c).z,
+        right = surface(x + 0.5 * TRACK * s, y - 0.5 * TRACK * c).z,
+        along = (front - rear) / (2 * AXLE), across = (left - right) / TRACK;
+      return { z: 0.25 * (front + rear + left + right), sx: along * c - across * s, sy: along * s + across * c };
+    }
     // Snapshots are feature-major: the state rows, then observations, actions, reward, done.
     const row = (k) => k * scene.cars;
     const BEAM = scene.state + 8, THROTTLE = scene.state + scene.obs + 1, DONE = THROTTLE + 2;
@@ -393,7 +403,7 @@
     };
     function frame(i) {
       const s = Array.from({ length: scene.state }, (_, k) => state[row(k) + i]),
-        ground = surface(s[0], s[1]),
+        ground = attitude(s[0], s[1], s[2]),
         up = unit([-ground.sx, -ground.sy, 1]),
         f = unit([
           Math.cos(s[2]),

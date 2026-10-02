@@ -34,7 +34,9 @@ builds without a GPU toolchain; `-D BEAMS=1081` uses every beam of the lidar.
 
 Every road boundary edge is extruded into a 0.5 m wall, so the lidar always
 sees the track and leaving the road is a crash. Built-in `flat`, `ramp`, and
-`bank` are ribbons around a circle. A YAML map is either a ROS occupancy image
+`bank` are ribbons around a circle. The chassis attitude (height, pitch, roll)
+comes from the road height under the four wheels, so a faceted mesh does not
+pitch the car at every facet. A YAML map is either a ROS occupancy image
 (the route is the longest skeleton loop of the free space) or OBJ meshes plus
 a text route:
 
@@ -57,22 +59,23 @@ closed: false
 uv run mojo -I . tests/test_mojo.mojo        # add `cpu` to skip the GPU
 ```
 
-Dynamics, map continuity (no per-cell height jumps), a thin wall seen by the
-lidar with crash/finish/reset, CPU/GPU parity, GAE boundaries, and the
-analytic PPO gradient against central finite differences.
+Dynamics, map continuity (no per-cell height jumps), smooth wheel-based
+attitude on the ramp, a thin wall seen by the lidar with crash/finish/reset,
+CPU/GPU parity, GAE boundaries, and the analytic PPO gradient against central
+finite differences.
 
 ## Layout
 
 | file | what it does |
 |---|---|
 | `main.mojo` | CLI: prepare, train, eval, benchmark, serve |
-| `racer/device.mojo` | `Device`: buffers, matrix views, `run` (MAX elementwise) and `gemm` (MAX matmul) |
+| `racer/device.mojo` | `Device`: buffers, matrix views, `run` (MAX elementwise), `gemm` (MAX matmul), `sum` |
 | `racer/map.mojo` | `.wrmap` header, bilinear surface / route projection used by kernels, shared vector helpers |
-| `racer/vehicle.mojo`, `lidar.mojo` | bicycle dynamics; 270-degree planar lidar over coarse-cell triangle lists |
+| `racer/vehicle.mojo`, `lidar.mojo` | bicycle dynamics; 270-degree planar lidar: one thread per beam marches the clearance field, then walks coarse-cell triangle lists |
 | `racer/simulation.mojo` | `Sim`: spawn, physics with rewards and resets, sensing, action sampling |
 | `racer/network.mojo` | `Policy`: tanh MLP forward and backward as matmuls with epilogues |
 | `racer/ppo.mojo` | `Trainer`: rollouts, GAE, clipped PPO minibatches, Adam, checkpoints |
-| `racer/compile.mojo` | map compiler: ribbons, OBJ + route, occupancy images, walls, grids, cell lists |
+| `racer/compile.mojo` | map compiler: ribbons, OBJ + route, occupancy images, walls, grids (parallel distance transform), cell lists |
 | `racer/serve.py` | `http.server` bridge for the viewer |
 | `viewer.html` | WebGL viewer; decodes the raw `.wrmap` and binary state snapshots |
 

@@ -69,7 +69,10 @@ def through[
 
 struct Policy:
     var theta: Buffer  # [P]: W0, W1, W2, log std
-    var w1t: Buffer  # [HA, H], refreshed after every update
+    # Transposed copies of W1 and W2 for the backward products: MAX's GPU
+    # matmul offers transpose_b but not transpose_a, and these are tiny next
+    # to the activations. Refreshed after every update.
+    var w1t: Buffer  # [HA, H]
     var w2t: Buffer  # [HA, OUT]
 
     def __init__(out self, device: Device, seed: Int) raises:
@@ -79,27 +82,29 @@ struct Policy:
         var theta = mat[1](self.theta, P)
 
         def init(i: Int) {var}:
-            """Gaussian fan-in init; bias columns start at zero."""
-            var z = NormalRandom(seed=UInt64(seed), subsequence=UInt64(i))
-            var value: Float32 = 0
+            """Gaussian fan-in init; bias columns start at zero, log std at -0.5."""
+            var scale: Float32 = 0
             if i < W1:
-                if i % IN < OBS:
-                    value = z.step_normal_4()[0] * sqrt(2 / Float32(OBS))
+                scale = sqrt(2 / Float32(OBS)) if i % IN < OBS else 0
             elif i < W2:
-                if i % HA < H:
-                    value = z.step_normal_4()[0] * sqrt(1 / Float32(H))
+                scale = sqrt(1 / Float32(H)) if i % HA < H else 0
             elif i < LOGSTD:
+                var actor = (i - W2) // HA < 2  # tiny actor weights: start neutral
                 if i % HA < H:
-                    var row = (i - W2) // HA
-                    value = z.step_normal_4()[0] * (Float32(0.125) if row == 2 else Float32(0.00125))
+                    scale = 0.00125 if actor else 0.125
             else:
-                value = -0.5
-            theta[0, i] = value
+                theta[0, i] = -0.5
+                return
+            if scale == 0:
+                theta[0, i] = 0
+                return
+            var z = NormalRandom(seed=UInt64(seed), subsequence=UInt64(i))
+            theta[0, i] = scale * z.step_normal_4()[0]
 
         device.run(init, P)
         self.transpose(device)
 
-    def transpose(mut self, device: Device) raises:
+    def transpose(self, device: Device) raises:
         var w1 = mat[H](self.theta, HA, W1)
         var w2 = mat[OUT](self.theta, HA, W2)
         var w1t = mat[HA](self.w1t, H)
@@ -113,10 +118,10 @@ struct Policy:
 
         device.run(kernel, HA, H)
 
-    def log_std(mut self) -> Mat[1]:
+    def log_std(self) -> Mat[1]:
         return mat[1](self.theta, 2, LOGSTD)
 
-    def forward(mut self, device: Device, x: Mat[IN], mut a: Activations) raises:
+    def forward(self, device: Device, x: Mat[IN], a: Activations) raises:
         device.gemm[epilogue=activate](
             mat[H](a.h1, a.cols), mat[H](self.theta, IN, W0), x
         )
@@ -128,14 +133,14 @@ struct Policy:
         )
 
     def backward(
-        mut self,
+        self,
         device: Device,
         x: Mat[IN],
-        mut a: Activations,
+        a: Activations,
         d3: Mat[OUT],
-        mut d2: Buffer,
-        mut d1: Buffer,
-        mut grad: Buffer,
+        d2: Buffer,
+        d1: Buffer,
+        grad: Buffer,
     ) raises:
         """Backpropagate output gradients d3 into `grad` (W0, W1, W2 entries)."""
         var h1 = mat[HA](a.h1, a.cols)
