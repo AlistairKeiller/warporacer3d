@@ -1,22 +1,22 @@
 """One device abstraction for the CPU and every GPU MAX supports.
 
-Buffers are flat float32 device memory; `mat` views them as row-major
-matrices with a static row count. Kernels are plain closures called once per
-index by MAX's `elementwise`, matrix products go through MAX's `matmul`, and
-`sum` reduces a row in a fixed order.
+Buffers are flat float32 device memory; `mat` views them as row-major matrices
+with a static row count. Kernels are closures called once per index by MAX's
+`elementwise`, matrix products are MAX's `matmul`, row sums are MAX's `sum`.
 """
 from std.sys import has_accelerator, get_defined_bool
-from std.pathlib import Path
+from std.utils import IndexList
+from std.python import Python
+from std.python.numpy import copy_to_numpy_array, from_numpy_array
 from layout import TileTensor, Coord, Idx, row_major, ComptimeInt
 from layout.tile_layout import RowMajorLayout
 from linalg.matmul import matmul
 from linalg.utils import elementwise_compute_lambda_type
-from max.algorithm.functional import elementwise
+from max.algorithm import elementwise, parallelize
+from max.algorithm.reduction import sum as reduce_sum
 from max.gpu.host import DeviceContext, DeviceBuffer
 
-comptime GPU_AVAILABLE = has_accelerator() and not get_defined_bool[
-    "CPU_ONLY", False
-]()
+comptime GPU_AVAILABLE = has_accelerator() and not get_defined_bool["CPU_ONLY", False]()
 comptime Buffer = DeviceBuffer[DType.float32]
 comptime Mat[rows: Int] = TileTensor[
     DType.float32, RowMajorLayout[ComptimeInt[rows], Int], MutAnyOrigin
@@ -24,24 +24,17 @@ comptime Mat[rows: Int] = TileTensor[
 comptime Kernel = ImplicitlyCopyable & RegisterPassable & def(Int) -> None
 comptime Kernel2 = ImplicitlyCopyable & RegisterPassable & def(Int, Int) -> None
 comptime Epilogue = Optional[elementwise_compute_lambda_type]
-comptime CHUNKS = 256  # partial sums of `Device.sum`
 
 
 def mat[rows: Int](buffer: Buffer, cols: Int, offset: Int = 0) -> Mat[rows]:
     """A `rows` x `cols` row-major view starting `offset` floats into `buffer`."""
-    return TileTensor(
-        ptr=buffer.unsafe_ptr()
-        .unsafe_mut_cast[True]()
-        .unsafe_origin_cast[MutAnyOrigin]()
-        .unsafe_offset(offset),
-        layout=row_major(Coord(Idx[rows], cols)),
-    )
+    var ptr = buffer.unsafe_ptr().unsafe_mut_cast[True]().unsafe_origin_cast[MutAnyOrigin]()
+    return TileTensor(ptr=ptr.unsafe_offset(offset), layout=row_major(Idx[rows], cols))
 
 
 struct Device(Movable):
     var ctx: DeviceContext
     var gpu: Bool
-    var partials: Buffer  # [CHUNKS] scratch for `sum`
 
     def __init__(out self, gpu: Bool) raises:
         comptime if GPU_AVAILABLE:
@@ -51,42 +44,40 @@ struct Device(Movable):
                 raise Error("GPU support is unavailable in this build; use cpu")
             self.ctx = DeviceContext(api="cpu")
         self.gpu = gpu
-        self.partials = self.ctx.enqueue_create_buffer[DType.float32](CHUNKS)
 
-    def alloc(self, count: Int) raises -> Buffer:
-        """A zeroed buffer. The fill is waited for: on the CPU, kernels run on
+    def alloc(self, count: Int, fill: Float32 = 0) raises -> Buffer:
+        """A filled buffer. The fill is waited for: on the CPU, kernels run on
         the calling thread and would otherwise race the queued fill."""
         var buffer = self.ctx.enqueue_create_buffer[DType.float32](count)
-        buffer.enqueue_fill(0)
+        buffer.enqueue_fill(fill)
         self.ctx.synchronize()
         return buffer^
 
     def run[F: Kernel, //](self, kernel: F, n: Int) raises:
-        """Call `kernel(i)` for every i < n: GPU threads or CPU tasks."""
+        """Call `kernel(i)` for every i < n: one GPU thread each, or CPU tasks."""
 
         def wrapped[width: Int, alignment: Int = 1](c: Coord) {var}:
             kernel(Int(c[0].value()))
 
-        self.launch(wrapped, Coord(n))
+        comptime if GPU_AVAILABLE:
+            if self.gpu:
+                return elementwise[1, target="gpu"](wrapped, Coord(n), self.ctx)
+        parallelize(kernel, n, Optional(self.ctx))
 
     def run[F: Kernel2, //](self, kernel: F, rows: Int, cols: Int) raises:
-        """Call `kernel(i, j)` over a rows x cols index space."""
+        """Call `kernel(i, j)` over rows x cols; adjacent GPU threads take adjacent j."""
 
         def wrapped[width: Int, alignment: Int = 1](c: Coord) {var}:
             kernel(Int(c[0].value()), Int(c[1].value()))
 
-        self.launch(wrapped, Coord(rows, cols))
+        def row(i: Int) {var}:
+            for j in range(cols):
+                kernel(i, j)
 
-    def launch[
-        F: ImplicitlyCopyable & RegisterPassable & def[
-            width: Int, alignment: Int = 1
-        ](Coord) -> None, //,
-    ](self, kernel: F, shape: Coord) raises:
         comptime if GPU_AVAILABLE:
             if self.gpu:
-                elementwise[1, target="gpu"](kernel, shape, self.ctx)
-                return
-        elementwise[1, target="cpu"](kernel, shape, self.ctx)
+                return elementwise[1, target="gpu"](wrapped, Coord(rows, cols), self.ctx)
+        parallelize(row, rows, Optional(self.ctx))
 
     def gemm[
         transpose_b: Bool = False, epilogue: Epilogue = None
@@ -99,43 +90,33 @@ struct Device(Movable):
         """c = a @ b (or a @ b^T) with an optional element-wise epilogue."""
         comptime if GPU_AVAILABLE:
             if self.gpu:
-                matmul[
-                    transpose_b=transpose_b,
-                    elementwise_compute_lambda_fn=epilogue,
-                    target="gpu",
+                return matmul[
+                    transpose_b=transpose_b, elementwise_compute_lambda_fn=epilogue, target="gpu"
                 ](c, a, b, Optional(self.ctx))
-                return
-        matmul[
-            transpose_b=transpose_b,
-            elementwise_compute_lambda_fn=epilogue,
-            target="cpu",
-        ](c, a, b, Optional(self.ctx))
+        matmul[transpose_b=transpose_b, elementwise_compute_lambda_fn=epilogue, target="cpu"](
+            c, a, b, Optional(self.ctx)
+        )
 
-    def sum[
-        squared: Bool = False
-    ](self, x: Mat[1], into: Mat[1], slot: Int, shift: Float32 = 0) raises:
-        """into[0, slot] = sum over the row vector x of (x - shift), or of its
-        square. Two fixed-order passes (CHUNKS strided partial sums, then one
-        thread adds them): deterministic on every device, unlike MAX 26.6's
-        GPU `reduction.sum`, which returned partial sums on Metal."""
-        var n = Int(x.dim[1]())
-        var partials = mat[1](self.partials, CHUNKS)
+    def sum[rows: Int](self, x: Mat[rows], into: Mat[1], slot: Int = 0) raises:
+        """into[0, slot + r] = the sum of row r of x."""
 
-        def partial(c: Int) {var}:
-            var total: Float32 = 0
-            for k in range(c, n, CHUNKS):
-                var v = x[0, k] - shift
-                total += v * v if squared else v
-            partials[0, c] = total
+        @__copy_capture(x)
+        @__parameter
+        def load[width: Int, rank: Int](idx: IndexList[rank]) -> SIMD[DType.float32, width]:
+            return x.load[width=width](Coord(idx[0], idx[1]))
 
-        def final(_i: Int) {var}:
-            var total: Float32 = 0
-            for c in range(CHUNKS):
-                total += partials[0, c]
-            into[0, slot] = total
+        @__copy_capture(into, slot)
+        @__parameter
+        def store[width: SIMDLength, rank: Int](idx: IndexList[rank], v: SIMD[DType.float32, width]):
+            into[0, slot + idx[0]] = v[0]
 
-        self.run(partial, CHUNKS)
-        self.run(final, 1)
+        var shape = Coord(rows, Int(x.dim[1]()))
+        comptime if GPU_AVAILABLE:
+            if self.gpu:
+                return reduce_sum[DType.float32, load, store, target="gpu", reduce_dim=1](
+                    shape, Optional(self.ctx)
+                )
+        reduce_sum[DType.float32, load, store, target="cpu", reduce_dim=1](shape, Optional(self.ctx))
 
     def read(self, buffer: Buffer) raises -> List[Float32]:
         var result = List[Float32](length=len(buffer), fill=0)
@@ -153,20 +134,10 @@ struct Device(Movable):
         return buffer^
 
 
-def read_floats(path: String) raises -> List[Float32]:
-    var raw = Path(path).read_bytes()
-    return List(
-        Span(
-            unsafe_ptr=raw.unsafe_ptr().unsafe_bitcast[Float32](),
-            length=len(raw) // 4,
-        )
-    )
+def save_floats(path: String, values: Span[Float32, _]) raises:
+    Python.import_module("numpy").save(path, copy_to_numpy_array(values))
 
 
-def write_floats(path: String, values: Span[Float32, _]) raises:
-    Path(path).write_bytes(
-        Span(
-            unsafe_ptr=values.unsafe_ptr().unsafe_bitcast[UInt8](),
-            length=len(values) * 4,
-        )
-    )
+def load_floats(path: String) raises -> List[Float32]:
+    var array = Python.import_module("numpy").load(path).astype("float32")
+    return List(from_numpy_array[DType.float32](array))

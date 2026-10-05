@@ -1,390 +1,234 @@
-"""Dynamics, map geometry, lidar, device parity, GAE, and PPO gradients.
+"""Dynamics, corridor lidar/crash/progress, bridge layers, CPU/GPU parity, GAE, and PPO gradients.
 
-    uv run mojo -I . tests/test_mojo.mojo [cpu]
+    uv run mojo run -I . tests/test_mojo.mojo [cpu]
 """
 from std.sys import argv
-from std.math import isfinite, exp, log, tanh, cos, sin, sqrt, atan2
+from std.math import isfinite, exp, tanh, floor, clamp, pi
+from std.python import Python
+from std.python.numpy import from_numpy_array
 from std.testing import assert_true, assert_almost_equal
 from racer.device import Device, mat, GPU_AVAILABLE
-from racer.vehicle import Car, frame, integrate
-from racer.map import Map
-from racer.compile import (
-    Mesh,
-    Route,
-    Track,
-    Vec3,
-    quad,
-    demo,
-    compile,
-)
-from racer.simulation import Sim, OBS, IN, OUT, X, Y, HEADING, EPISODE, STEPS, CRASH, FINISH, attitude
-from racer.network import Policy, P, H, HA, W0, W1, W2, LOGSTD
-from racer.ppo import Trainer, ROLLOUT, MINIBATCHES, permutation
-from racer.lidar import BEAMS, RANGE, FOV, MOUNT_FORWARD, Vec, ray, walk
+from racer.sim import Sim, Map, derivative, Vec, GRIP, G, STEER_MAX, ACCEL_MAX, SPEED_MAX, HORIZON, HALF_LOG_2PI
+from racer.sim import STATE, IN, OBS, OUT, BEAMS, RANGE, X, Y, HEADING, SPEED, STEER, STEPS, EPISODE, FRICTION, RETURN, PROGRESS, CRASH
+from racer.ppo import Policy, Activations, Trainer, P, H, HA, W0, W1, W2, LOGSTD, ROLLOUT, MINIBATCHES, GAMMA, LAMBDA
+
+comptime CELL = Float32(0.05)
+comptime NX = 281
+comptime NY = 161
+comptime WP = 74
+comptime N = 4  # cars in the PPO tests
+comptime BATCH = N * ROLLOUT // MINIBATCHES
 
 
-def close(a: List[Float32], b: List[Float32], tolerance: Float64, message: String) raises:
-    for i in range(len(a)):
-        assert_almost_equal(a[i], b[i], message, atol=tolerance, rtol=0)
+def ramp(x: Float32) -> Float32:
+    return max(x - 8, 0) * 0.5
 
 
-def vehicle_tests() raises:
-    var rest = Car(0, 0, 0, 0, 0, 0, 0)
-    for _ in range(2400):
-        integrate(rest, frame(0, 0, 0), 0, 0, 1.1, 1)
-    assert_true(rest.x == 0 and rest.u == 0 and rest.yaw == 0, "rest stays at rest")
-    var car = rest
-    for _ in range(2400):
-        integrate(car, frame(car.heading, 0, 0), 0, 1, 1.1, 1)
-    assert_true(car.x > 25 and car.u > 3 and car.u < 5 and abs(car.y) < 1e-6, "straight driving")
-    var speed = car.u
-    for _ in range(240):
-        integrate(car, frame(car.heading, 0, 0), 0, 0, 1.1, 1)
-    assert_true(car.u < speed and car.u > 0, "coasting loses speed")
-    car = rest
-    for _ in range(480):
-        integrate(car, frame(car.heading, 0, 0), 0.5, -1, 1.1, 1)
-    assert_true(car.u < -1 and car.yaw < 0 and isfinite(car.v), "reverse steering")
-    var level = Car(0, 0, 0, 2, 0, 0, 0)
-    var uphill = level
-    integrate(level, frame(0, 0, 0), 0, 0, 1.1, 1)
-    integrate(uphill, frame(0, 0.3, 0), 0, 0, 1.1, 1)
-    assert_true(uphill.u < level.u, "gravity slows the car uphill")
-    for slope in range(-3, 4):
-        var f = frame(0.6, Float32(slope) * 0.1, -0.2)
-        assert_true(abs(f.fx * f.fx + f.fy * f.fy + f.fz * f.fz - 1) < 1e-5, "unit forward")
-        assert_true(abs(f.fx * f.lx + f.fy * f.ly + f.fz * f.lz) < 1e-5, "orthogonal frame")
-    for n in range(1, 20):
-        var seen = List[Bool](length=n * ROLLOUT, fill=False)
-        for i in range(n * ROLLOUT):
-            var j = permutation(i, n, 123)
-            assert_true(not seen[j], "the minibatch permutation is a bijection")
-            seen[j] = True
-    print("vehicle dynamics, terrain frames, and shuffle: passed")
+def corridor() -> List[Float32]:
+    """A 12 x 6 m corridor along +x from (0, -3): flat, then a 1:2 ramp face from x = 8,
+    with waypoints every 0.15 m along y = 0 from x = 0.5 (see racer/track.py for the layout)."""
+    var d: List[Float32] = [Float32(NX), Float32(NY), -1, -4, CELL, Float32(WP), 0.15, 1, 0.5, 0, 0, 0]
+    for which in range(3):  # clearance, height, nearest waypoint
+        for iy in range(NY):
+            for ix in range(NX):
+                var x = -1 + CELL * Float32(ix)
+                var y = -4 + CELL * Float32(iy)
+                var nearest = Float32(clamp(Int(floor((x - 0.5) / 0.15 + 0.5)), 0, WP - 1))
+                d.append(min(x, min(12 - x, 3 - abs(y))) if which == 0 else (ramp(x) if which == 1 else nearest))
+    for w in range(WP):
+        d.extend([0.5 + 0.15 * Float32(w), 0, ramp(0.5 + 0.15 * Float32(w)), 0])
+    return d^
 
 
-def map_tests() raises:
-    for kind in ["flat", "ramp", "bank"]:
-        var data = compile(demo(String(kind)), 0.05)
-        var map = Map(data)
-        assert_true(map.spawns > 0 and map.triangles > 0, "demo maps have spawns and walls")
-        var heights = Span(data)[map.height : map.height + map.nx * map.ny]
-        var top: Float32 = 0
-        for h in heights:
-            top = max(top, h)
-        assert_true((top > 1) == (kind == "ramp"), "only the ramp climbs")
-        # Height and clearance must be continuous along the road, which the
-        # old nearest-cell lookup was not (cars bobbed once per cell).
-        var copy = Device(False).upload(data)
-        var d = mat[1](copy, len(data))
-        var previous = map.surface(d, 6, 0)
-        for k in range(1, 2000):
-            var angle = Float32(k) * 0.0005
-            var here = map.surface(d, 6 * cos(angle), 6 * sin(angle))
-            assert_true(here.clearance > 0.5, "the route centre is clear of the walls")
-            assert_true(abs(here.height - previous.height) < 0.004, "height is continuous")
-            assert_true(abs(here.clearance - previous.clearance) < 0.01, "clearance is continuous")
-            previous = here
-    print("map compiler geometry and continuity: passed")
+def step(device: Device, sim: Sim) raises:
+    var n = sim.n
+    sim.step(device, mat[2](sim.actions, n), mat[1](sim.reward, n), mat[1](sim.done, n), mat[IN](sim.obs, n))
 
 
-def attitude_tests() raises:
-    """The chassis attitude comes from the ground under the wheels, so the
-    facets of a curved ribbon (whose two triangles per quad have different
-    grades) do not pitch the car at every cell: no more stair-step bobbing."""
-    var data = compile(demo("ramp"), 0.025)
-    var map = Map(data)
+def physics_tests() raises:
+    assert_true(derivative(Vec(0, 0, 0, 0), 0, 0, GRIP, 0, 0) == Vec(0), "a car at rest stays at rest")
+    assert_true(derivative(Vec(0, 0, 0, 2), 0, 0, GRIP, 0.3, 0)[3] < 0, "an uphill slope slows the car")
+    assert_true(derivative(Vec(0, 0, 0, 2), 0, 0, GRIP, 0, 0)[3] == 0, "coasting on the flat holds speed")
+    var limit = derivative(Vec(0, 0, 0, 5), STEER_MAX, ACCEL_MAX, GRIP, 0, 0)
+    assert_true(abs(limit[2] * 5) <= GRIP * G + 1e-4 and limit[3] <= 1e-4, "the friction circle caps the tyres")
+    assert_true(derivative(Vec(0, 0, 0, 2), 0.2, 0, GRIP, 0, 0)[2] > 0.5, "steering yaws the car")
+    print("dynamics: passed")
+
+
+def corridor_tests() raises:
+    var track = corridor()
     var cpu = Device(False)
-    var copy = cpu.upload(data)
-    var d = mat[1](copy, len(data))
-    var previous: Float32 = 0
-    for k in range(7500):
-        var angle = Float32(k) * 0.005 / 6
-        var a = attitude(map, d, 6 * cos(angle), 6 * sin(angle), angle + 1.5707964)
-        var slope = -a.sx * sin(angle) + a.sy * cos(angle)
-        assert_true(k == 0 or abs(slope - previous) < 0.005, "the grade under the wheels is smooth")
-        previous = slope
-    var n = 1
-    var sim = Sim(cpu, data, n, 7)
-    sim.spawn_all(cpu)
-    cpu.write(sim.actions, [Float32(0), 1])
-    var last: Float32 = 0
-    var climbed = False
-    for t in range(600):
-        sim.physics(cpu, mat[2](sim.actions, n), mat[1](sim.reward, n), mat[1](sim.done, n))
-        var s = cpu.read(sim.state)
-        var a = attitude(map, d, s[X], s[Y], s[HEADING])
-        var f = frame(s[HEADING], a.sx, a.sy)
-        var pitch = atan2(f.fz, sqrt(f.fx * f.fx + f.fy * f.fy)) * 57.29578
-        if t > 0 and cpu.read(sim.done)[0] == 0:
-            assert_true(abs(pitch - last) < 1, "pitch changes smoothly between steps")
-        climbed = climbed or abs(pitch) > 3
-        last = pitch
-    assert_true(climbed, "the car drove onto the ramp")
-    print("wheel-based attitude is smooth along and while driving the ramp: passed")
-
-
-def arena(width: Float64, wall_x: Float64) raises -> List[Float32]:
-    """An open floor with a thin wall across the middle and a straight route."""
-    var floor = Mesh(List[Vec3](), List[Int]())
-    quad(floor, Vec3(-4, -3, 0, 0), Vec3(4, -3, 0, 0), Vec3(4, 3, 0, 0), Vec3(-4, 3, 0, 0))
-    var wall = Mesh(List[Vec3](), List[Int](), True)
-    quad(wall, Vec3(wall_x, -3, 0, 0), Vec3(wall_x, 3, 0, 0), Vec3(wall_x, 3, 0.6, 0), Vec3(wall_x, -3, 0.6, 0))
-    var route = Route([Vec3(-3, 0, 0, 0), Vec3(3, 0, 0, 0)], [width, width], List[Vec3](), False)
-    return compile(Track([floor^, wall^], route^))
-
-
-def environment_tests(gpu: Bool) raises:
-    var data = arena(1.5, 0.011)
-    var n = 32
-    var cpu = Device(False)
-    var sim = Sim(cpu, data, n, 42)
-    sim.spawn_all(cpu)
-    sim.sense(cpu, mat[IN](sim.obs, n))
-    var state = cpu.read(sim.state)
-    var obs = cpu.read(sim.obs)
-    var middle = BEAMS // 2
-    var left = False
-    var right = False
+    var n = 4  # at rest facing the ramp; full throttle into the wall; straight; steering left
+    var sim = Sim(cpu, Span(track), n, 1)
+    var s = List[Float32](length=STATE * n, fill=0)
     for i in range(n):
-        assert_true(state[EPISODE * n + i] == 1, "every spawn is valid")
-        var x = state[X * n + i]
-        var forward = obs[(8 + middle) * n + i] * RANGE
-        if x < -0.5:
-            left = True
-            assert_almost_equal(forward, 0.011 - x - MOUNT_FORWARD, "the centre beam hits the wall", atol=2e-3, rtol=0)
-        elif x > 0.5:
-            right = True
-            assert_almost_equal(forward, 4 - x - MOUNT_FORWARD, "the centre beam hits the far wall", atol=2e-3, rtol=0)
-        assert_true(obs[OBS * n + i] == 1, "the bias input is one")
-    assert_true(left and right, "spawns on both sides of the wall")
-    var actions = List[Float32](length=n, fill=0)
-    actions.extend(List[Float32](length=n, fill=1))
-    cpu.write(sim.actions, actions)
+        s[X * n + i], s[FRICTION * n + i], s[PROGRESS * n + i] = 1, 1, Float32(0.5 / 0.15)
+    s[HEADING * n + 1] = Float32(pi)
+    cpu.write(sim.state, s)
+    cpu.write(sim.actions, [0, 0, 0, 1, 0, 1, 1, 1])
+    step(cpu, sim)
+    var o = cpu.read(sim.obs)
+    assert_almost_equal(o[(4 + BEAMS // 2) * n] * RANGE, 7.1, "the centre beam stops on the ramp face", atol=0.1, rtol=0)
+    assert_almost_equal(o[(4 + BEAMS // 2) * n + 1] * RANGE, 0.73, "the centre beam reads the wall", atol=0.1, rtol=0)
     var crashed = False
-    var finished = False
-    for _ in range(600):
-        sim.physics(cpu, mat[2](sim.actions, n), mat[1](sim.reward, n), mat[1](sim.done, n))
-        var done = cpu.read(sim.done)
-        var steps = cpu.read(sim.state)
-        for i in range(n):
-            if done[i] > 0:
-                assert_true(steps[STEPS * n + i] == 0, "terminal cars respawn at once")
-            crashed = crashed or done[i] == CRASH
-            finished = finished or done[i] == FINISH
-    assert_true(crashed and finished, "hitting the wall crashes; the open side finishes")
-    sim.sense(cpu, mat[IN](sim.obs, n))
-    for value in cpu.read(sim.obs):
-        assert_true(isfinite(value), "observations stay finite")
-    print("spawns, thin-wall lidar, crash, finish, and reset: passed")
-    if not gpu:
-        return
-    var metal = Device(True)
-    var other = Sim(metal, data, n, 42)
-    other.spawn_all(metal)
-    metal.write(other.actions, actions)
-    sim = Sim(cpu, data, n, 42)
-    sim.spawn_all(cpu)
-    cpu.write(sim.actions, actions)
     for _ in range(60):
-        sim.physics(cpu, mat[2](sim.actions, n), mat[1](sim.reward, n), mat[1](sim.done, n))
-        other.physics(metal, mat[2](other.actions, n), mat[1](other.reward, n), mat[1](other.done, n))
-    sim.sense(cpu, mat[IN](sim.obs, n))
-    other.sense(metal, mat[IN](other.obs, n))
-    close(cpu.read(sim.state), metal.read(other.state), 2e-3, "CPU/GPU dynamics agree")
-    close(cpu.read(sim.obs), metal.read(other.obs), 1e-2, "CPU/GPU sensing agrees")
-    print("CPU/GPU dynamics and sensing: passed")
+        step(cpu, sim)
+        var done = cpu.read(sim.done)
+        assert_true(done[0] == 0 and done[2] == 0 and done[3] == 0, "the open road does not crash")
+        if done[1] == CRASH and not crashed:
+            s = cpu.read(sim.state)
+            assert_true(s[STEPS * n + 1] == 0 and s[EPISODE * n + 1] == 1, "a crash respawns at once")
+            crashed = True
+    assert_true(crashed, "driving into the wall crashes")
+    s = cpu.read(sim.state)
+    o = cpu.read(sim.obs)
+    assert_true(s[X * n] == 1 and s[SPEED * n] == 0 and s[HEADING * n] == 0, "a car at rest stays at rest")
+    assert_true(s[SPEED * n + 2] == SPEED_MAX and s[X * n + 2] > 3.5 and abs(s[Y * n + 2]) < 1e-4, "full throttle")
+    assert_almost_equal(s[RETURN * n + 2], 10 * (s[X * n + 2] - 1), "continuous progress reward", atol=0.01, rtol=0)
+    assert_true(s[Y * n + 3] > 0.1 and s[X * n + 3] < s[X * n + 2], "steering turns the car left")
+    assert_true(o[n + 2] == 1 and o[OBS * n + 2] == 1, "speed and bias observations")
+    for value in o:
+        assert_true(isfinite(value), "observations stay finite")
+    print("corridor lidar, crash, respawn, speed cap, progress, steering: passed")
 
 
-def lidar_tests() raises:
-    """The clearance-field march must hand over before anything the exact
-    triangle walk would hit, so both agree on every beam of driven cars."""
-    var n = 64
-    var device = Device(False)
-    var data = compile(demo("ramp"), 0.05)
-    var sim = Sim(device, data, n, 7)
-    sim.spawn_all(device)
-    var actions = List[Float32](length=n, fill=0.3)
-    actions.extend(List[Float32](length=n, fill=1))
-    device.write(sim.actions, actions)
-    for _ in range(90):
-        sim.physics(device, mat[2](sim.actions, n), mat[1](sim.reward, n), mat[1](sim.done, n))
-    sim.sense(device, mat[IN](sim.obs, n))
-    var poses = device.read(sim.pose)
-    var copy = device.upload(data)
-    var d = mat[1](copy, len(data))
-    assert_true(sim.map.slope > 0.3 and sim.map.slope < 0.4, "the ramp's slope bound")
-    for i in range(n):
-        var origin = Vec(poses[i], poses[n + i], poses[2 * n + i], 0)
-        var forward = Vec(poses[3 * n + i], poses[4 * n + i], poses[5 * n + i], 0)
-        var left = Vec(poses[6 * n + i], poses[7 * n + i], poses[8 * n + i], 0)
-        for beam in range(0, BEAMS, 5):
-            var azimuth = -FOV / 2 + Float32(beam) * (FOV / Float32(BEAMS - 1))
-            var direction = cos(azimuth) * forward + sin(azimuth) * left
-            var exact = walk(sim.map, d, origin, direction, RANGE)
-            assert_almost_equal(ray(sim.map, d, origin, direction), exact, "the lidar march agrees with the exact walk", atol=1e-3, rtol=0)
-    print("lidar march against the exact triangle walk: passed")
+def bridge_tests(track: Span[Float32, _]) raises:
+    var cpu = Device(False)
+    var map = Map(track)
+    var copy = cpu.upload(track)
+    var d = mat[1](copy, len(track))
+    assert_true(map.layers == 2 and map.probe(d, 0, 0, 0).layer == 0 and map.probe(d, 0, 0, 0.5).layer == 1, "layer by height")
+    assert_true(map.probe(d, 0, 0, 0).clearance > 1 and map.probe(d, 0, 0, 0.9).clearance > 1, "both roads cross at the origin")
+    for w in range(0, map.waypoints, 2):
+        var x, y, z = map.waypoint(d, w, 0), map.waypoint(d, w, 1), map.waypoint(d, w, 2)
+        var spot = map.probe(d, x, y, z)
+        assert_true(spot.clearance > 0.9, "the route centre is clear of walls")
+        assert_almost_equal(map.surface(d, spot.layer, x, y).height, z, "the surface follows the route", atol=0.03, rtol=0)
+        assert_almost_equal(map.progress(d, spot.layer, x, y), Float32(w), "progress counts waypoints", atol=1e-3, rtol=0)
+    print("bridge layers, surface, clearance, progress: passed")
 
 
-def gae_tests() raises:
-    var device = Device(False)
-    var trainer = Trainer(device, 1)
-    var values = List[Float32](length=ROLLOUT + 1, fill=0)
-    values[ROLLOUT] = 123
-    device.write(trainer.value, values)
-    device.write(trainer.reward, List[Float32](length=ROLLOUT, fill=1))
-    var done = List[Float32](length=ROLLOUT, fill=0)
-    done[30] = 1
-    device.write(trainer.done, done)
-    trainer.gae(device)
-    var targets = device.read(trainer.target)
-    assert_almost_equal(targets[30], 1, "GAE stops at terminal states", atol=1e-5, rtol=0)
-    assert_almost_equal(targets[29], 1.9405, "GAE recurrence", atol=1e-5, rtol=0)
-    assert_almost_equal(targets[31], 122.77, "the rollout tail bootstraps", atol=1e-4, rtol=0)
-    print("GAE episode boundaries: passed")
+def drive(gpu: Bool, track: Span[Float32, _]) raises -> List[Float32]:
+    """Poses and observations of 8 cars after a reset and 10 steps with fixed actions."""
+    var device = Device(gpu)
+    var n = 8
+    var sim = Sim(device, track, n, 42)
+    sim.reset(device)
+    device.write(sim.actions, [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 1, 1, 1, 1, 1, 1, 1, 1])
+    for _ in range(10):
+        step(device, sim)
+    var result = device.read(sim.state)
+    result.resize((STEER + 1) * n, 0)
+    result.extend(device.read(sim.obs))
+    return result^
 
 
-# ===-------------------------------------------------------------------=== #
-# PPO gradient: analytic backprop vs central finite differences (float64).
-# ===-------------------------------------------------------------------=== #
-
-comptime GRAD_N = 4
-comptime BATCH = GRAD_N * ROLLOUT // MINIBATCHES
-
-
-def fixture(device: Device, trainer: Trainer) raises:
-    """Deterministic rollout storage: observations, actions, old log probs,
-    values, advantages, and targets for GRAD_N cars."""
-    var n = GRAD_N
-    var obs = List[Float32](length=(ROLLOUT + 1) * IN * n, fill=0)
-    var actions = List[Float32](length=ROLLOUT * 2 * n, fill=0)
-    var logp = List[Float32](length=ROLLOUT * n, fill=0)
-    var values = List[Float32](length=(ROLLOUT + 1) * n, fill=0)
-    var advantage = List[Float32](length=ROLLOUT * n, fill=0)
-    var target = List[Float32](length=ROLLOUT * n, fill=0)
-    for s in range(ROLLOUT * n):
-        var t = s // n
-        var i = s % n
-        for r in range(OBS):
-            obs[(t * IN + r) * n + i] = 0.2 * Float32(((s * OBS + r) * 7919) % 1000) / 1000 - 0.1
-        obs[(t * IN + OBS) * n + i] = 1
-        actions[(t * 2) * n + i] = -0.4 + 0.1 * Float32(s % 9)
-        actions[(t * 2 + 1) * n + i] = -0.2 + 0.05 * Float32(s % 11)
-        values[s] = 0.1 * Float32(s % 7) - 0.3
-        logp[s] = -0.5 - 0.3 * Float32(s % 8)
-        advantage[s] = Float32((s * 37) % 11) / 5 - 1
-        target[s] = Float32((s * 53) % 13) / 6 - 1
-    device.write(trainer.obs, obs)
-    device.write(trainer.actions, actions)
-    device.write(trainer.logp, logp)
-    device.write(trainer.value, values)
-    device.write(trainer.advantage, advantage)
-    device.write(trainer.target, target)
+def layer(x: List[Float64], w: List[Float64], at: Int, rows: Int, squash: Bool) -> List[Float64]:
+    """`rows` x len(x) weights at `at` applied to x, with a trailing constant 1."""
+    var y = List[Float64](length=rows + 1, fill=1)
+    for j in range(rows):
+        var acc: Float64 = 0
+        for k in range(len(x)):
+            acc += x[k] * w[at + j * len(x) + k]
+        y[j] = tanh(acc) if squash else acc
+    return y^
 
 
-def host_loss(w: List[Float64], trainer: Trainer, device: Device) raises -> Float64:
-    """The clipped PPO objective of minibatch 0 in float64 on the host."""
-    var n = GRAD_N
+def host_loss(w: List[Float64], device: Device, trainer: Trainer) raises -> Float64:
+    """Minibatch 0's clipped PPO objective in float64 with raw advantages."""
     var obs = device.read(trainer.obs)
     var actions = device.read(trainer.actions)
     var logp = device.read(trainer.logp)
-    var values = device.read(trainer.value)
+    var value = device.read(trainer.value)
     var advantage = device.read(trainer.advantage)
-    var target = device.read(trainer.target)
     var total: Float64 = 0
     for b in range(BATCH):
-        var s = permutation(b, n, 0)
-        var t = s // n
-        var i = s % n
-        var h1 = List[Float64](length=HA, fill=1)
-        var h2 = List[Float64](length=HA, fill=1)
-        for j in range(H):
-            var acc: Float64 = 0
-            for k in range(IN):
-                acc += Float64(obs[(t * IN + k) * n + i]) * w[W0 + j * IN + k]
-            h1[j] = tanh(acc)
-        for j in range(H):
-            var acc: Float64 = 0
-            for k in range(HA):
-                acc += h1[k] * w[W1 + j * HA + k]
-            h2[j] = tanh(acc)
-        var out = List[Float64](length=OUT, fill=0)
-        for o in range(OUT):
-            for k in range(HA):
-                out[o] += h2[k] * w[W2 + o * HA + k]
+        var s = b * MINIBATCHES
+        var x = List[Float64]()
+        for r in range(IN):
+            x.append(Float64(obs[(s // N * IN + r) * N + s % N]))
+        var o = layer(layer(layer(x, w, W0, H, True), w, W1, H, True), w, W2, OUT, False)
         var new_logp: Float64 = 0
         for a in range(2):
-            var error = Float64(actions[(t * 2 + a) * n + i]) - out[a]
-            var ls = w[LOGSTD + a]
-            new_logp -= 0.5 * error * error * exp(-2 * ls) + ls + 0.918938533204673
-        var ratio = exp(new_logp - Float64(logp[s]))
-        var adv = Float64(advantage[s])
-        var clipped = min(max(ratio, 0.8), 1.2)
-        total -= min(ratio * adv, clipped * adv) / BATCH
-        var old = Float64(values[s])
-        var value = out[2]
-        var clipped_value = old + min(max(value - old, -0.2), 0.2)
-        var d = value - Float64(target[s])
-        var dc = clipped_value - Float64(target[s])
-        total += 0.25 * max(d * d, dc * dc) / BATCH
+            var error = Float64(actions[(s // N * 2 + a) * N + s % N]) - o[a]
+            new_logp -= 0.5 * error * error * exp(-2 * w[LOGSTD + a]) + w[LOGSTD + a] + Float64(HALF_LOG_2PI)
+        var ratio, adv = exp(new_logp - Float64(logp[s])), Float64(advantage[s])
+        total -= min(ratio * adv, clamp(ratio, 0.8, 1.2) * adv) / BATCH
+        var e = abs(o[2] - Float64(value[s] + advantage[s]))  # Huber value loss, matching `minibatch`
+        total += (0.25 * e * e if e <= 1 else 0.5 * e - 0.25) / BATCH
     return total
 
 
-def gradient(device: Device, policy: Policy, trainer: Trainer) raises -> List[Float32]:
-    """One minibatch's analytic gradient via the trainer's own kernels."""
-    fixture(device, trainer)
-    trainer.minibatch(device, policy, 0, 0, 0, 1)
-    return device.read(trainer.grad)
-
-
-def gradient_tests(gpu: Bool) raises:
-    var cpu = Device(False)
-    var policy = Policy(cpu, 42)
-    var trainer = Trainer(cpu, GRAD_N)
-    var analytic = gradient(cpu, policy, trainer)
-    var weights = List[Float64]()
-    for value in cpu.read(policy.theta):
-        weights.append(Float64(value))
-    var largest: Float32 = 0
-    for value in analytic:
-        largest = max(largest, abs(value))
-    assert_true(largest > 1e-4, "the fixture produces a nontrivial gradient")
+def ppo_tests(gpu: Bool, track: Span[Float32, _]) raises:
+    """One rollout on `flat`: GAE recomputed on the host, the analytic gradient of
+    minibatch 0 against finite differences, then an update with a finite KL."""
+    var device = Device(gpu)
+    var sim = Sim(device, track, N, 42)
+    sim.reset(device)
+    var s = device.read(sim.state)
+    for i in range(N):
+        s[STEPS * N + i] = Float32(HORIZON - 5 - 7 * i)  # episodes end mid-rollout
+    device.write(sim.state, s)
+    var policy = Policy(device, 42)
+    var acts = Activations(device, N)
+    var trainer = Trainer(device, N)
+    assert_true(isfinite(trainer.rollout(device, sim, policy, acts, 0)), "rollout reward")
+    var reward = device.read(trainer.reward)
+    var done = device.read(trainer.done)
+    var value = device.read(trainer.value)
+    var advantage = device.read(trainer.advantage)
+    var last = device.read(acts.o)  # the policy on the final observations: the bootstrap values
+    var ended = 0
+    for i in range(N):
+        var running: Float32 = 0
+        var next = last[2 * N + i]
+        for t in range(ROLLOUT - 1, -1, -1):
+            var k = t * N + i
+            var alive = Float32(1 if done[k] == 0 else 0)
+            ended += Int(done[k] != 0)
+            running = reward[k] + GAMMA * alive * next - value[k] + GAMMA * LAMBDA * alive * running
+            assert_almost_equal(advantage[k], running, "GAE advantage", atol=1e-4, rtol=0)
+            next = value[k]
+    assert_true(ended == N, "every car's episode ended once during the rollout")
+    trainer.minibatch(device, policy, 0, 0, 1)
+    var analytic = device.read(trainer.grad)
+    var w = List[Float64]()
+    for value in device.read(policy.theta):
+        w.append(Float64(value))
     var worst: Float64 = 0
-    var checked = 0
+    var largest: Float64 = 0
     var i = 0
     while i < P:
-        var eps: Float64 = 1e-4
-        var saved = weights[i]
-        weights[i] = saved + eps
-        var plus = host_loss(weights, trainer, cpu)
-        weights[i] = saved - eps
-        var minus = host_loss(weights, trainer, cpu)
-        weights[i] = saved
-        var numeric = (plus - minus) / (2 * eps)
+        w[i] += 1e-4
+        var plus = host_loss(w, device, trainer)
+        w[i] -= 2e-4
+        var numeric = (plus - host_loss(w, device, trainer)) / 2e-4
+        w[i] += 1e-4
         var error = abs(numeric - Float64(analytic[i]))
-        if error > 1e-5 + 5e-3 * abs(numeric):
-            raise Error(
-                "gradient " + String(i) + " analytic " + String(analytic[i]) + " numeric " + String(numeric)
-            )
-        worst = max(worst, error)
-        checked += 1
-        i += 97 if i < LOGSTD - 97 else 1
-    print("analytic PPO gradient matches finite differences:", checked, "entries, worst error", worst)
-    if gpu:
-        var metal = Device(True)
-        var other_policy = Policy(metal, 42)
-        var other = Trainer(metal, GRAD_N)
-        var fast = gradient(metal, other_policy, other)
-        close(fast, analytic, Float64(2e-2 * largest + 1e-5), "CPU/GPU gradients agree")
-        print("CPU/GPU gradients agree (GPU fp32 matmul may be TF32-like)")
+        if error > (3e-2 * abs(numeric) + 1e-3 if gpu else 5e-3 * abs(numeric) + 1e-5):
+            raise Error("gradient " + String(i) + " analytic " + String(analytic[i]) + " numeric " + String(numeric))
+        worst, largest = max(worst, error), max(largest, abs(numeric))
+        i += 293 if i < LOGSTD - 293 else 1
+    assert_true(largest > 1e-3, "the rollout produces a nontrivial gradient")
+    var kl = trainer.update(device, policy)
+    assert_true(isfinite(kl) and kl >= 0 and kl < 0.1, "KL after one update")
+    print("GAE, PPO gradient (worst error", worst, "of", largest, ") and update on", "GPU" if gpu else "CPU", ": passed")
 
 
 def main() raises:
     var gpu = GPU_AVAILABLE if len(argv()) < 2 else String(argv()[1]) != "cpu"
-    vehicle_tests()
-    map_tests()
-    attitude_tests()
-    environment_tests(gpu)
-    lidar_tests()
-    gae_tests()
-    gradient_tests(gpu)
+    Python.add_to_path(".")
+    var tracks = Python.import_module("racer.track")
+    var flat = tracks.load("flat")
+    var bridge = tracks.load("bridge")
+    physics_tests()
+    corridor_tests()
+    bridge_tests(from_numpy_array[DType.float32](bridge))
+    ppo_tests(False, from_numpy_array[DType.float32](flat))
+    if gpu:
+        var a = drive(False, from_numpy_array[DType.float32](flat))
+        var b = drive(True, from_numpy_array[DType.float32](flat))
+        for i in range(len(a)):
+            assert_almost_equal(a[i], b[i], "CPU/GPU poses and observations agree", atol=3e-3, rtol=0)
+        print("CPU/GPU parity: passed")
+        ppo_tests(True, from_numpy_array[DType.float32](flat))

@@ -1,6 +1,5 @@
 .venv/
 build/
-*.wrmap
-*.wrppo
+*.npy
 .DS_Store
 __pycache__/

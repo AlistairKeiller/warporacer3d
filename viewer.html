@@ -4,377 +4,197 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>WarpORacer · Mojo</title>
   <style>
-    :root {
-      color-scheme: dark;
-      font:
-        14px system-ui,
-        sans-serif;
-      color: #e6edf3;
-      background: #10171e;
-    }
-    * {
-      box-sizing: border-box;
-    }
-    body {
-      margin: 0;
-    }
-    canvas {
-      display: block;
-      width: 100vw;
-      height: 100vh;
-    }
-    aside {
-      position: absolute;
-      top: 20px;
-      left: 20px;
-      width: 278px;
-      background: #14212bee;
-      border: 1px solid #34424f;
-      border-radius: 14px;
-      padding: 20px;
-      box-shadow: 0 10px 40px #0005;
-    }
-    h1 {
-      font-size: 20px;
-      margin: 0 0 4px;
-    }
-    small,
-    .muted {
-      color: #94a7b5;
-    }
-    p {
-      line-height: 1.5;
-      margin: 12px 0;
-    }
-    button,
-    select {
-      background: #233542;
-      color: inherit;
-      border: 1px solid #425464;
-      border-radius: 7px;
-      padding: 8px;
-      cursor: pointer;
-    }
-    button:hover {
-      background: #344b5c;
-    }
-    .row {
-      display: flex;
-      gap: 8px;
-      margin: 12px 0;
-    }
-    .row > * {
-      flex: 1;
-    }
-    label {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin: 12px 0;
-    }
-    dl {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 9px;
-      margin: 18px 0;
-    }
-    dt {
-      color: #94a7b5;
-    }
-    dd {
-      margin: 0;
-      text-align: right;
-      font-variant-numeric: tabular-nums;
-    }
-    #status {
-      color: #78dbb6;
-      min-height: 20px;
-    }
-    :focus-visible {
-      outline: 2px solid #78dbb6;
-      outline-offset: 2px;
-    }
-    footer {
-      position: absolute;
-      bottom: 18px;
-      left: 20px;
-      color: #b0c0cd;
-      background: #14212bcc;
-      padding: 10px 14px;
-      border-radius: 8px;
-    }
-    #error {
-      color: #ffaf9d;
-      white-space: pre-wrap;
-    }
-    input {
-      accent-color: #78dbb6;
-    }
-    @media (max-width: 600px) {
-      aside {
-        width: 230px;
-        left: 10px;
-        top: 10px;
-        padding: 14px;
-      }
-      footer {
-        font-size: 12px;
-        left: 10px;
-      }
-    }
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; color: #e6edf3; background: #10171e; }
+    body { margin: 0; overflow: hidden; } canvas { display: block; }
+    aside { position: absolute; top: 16px; left: 16px; width: 270px; padding: 16px; background: #14212bee;
+      border: 1px solid #34424f; border-radius: 12px; box-shadow: 0 10px 40px #0005; }
+    h1 { font-size: 18px; margin: 0 0 4px; } small, .muted, dt { color: #94a7b5; }
+    button, select { background: #233542; color: inherit; border: 1px solid #425464; border-radius: 6px; padding: 6px; cursor: pointer; }
+    .row { display: flex; gap: 6px; margin: 10px 0; } .row > * { flex: 1; }
+    label { display: flex; justify-content: space-between; align-items: center; margin: 8px 0; }
+    dl { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 14px 0; } dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+    #status { color: #78dbb6; min-height: 20px; } #error { color: #ffaf9d; white-space: pre-wrap; } input { accent-color: #78dbb6; }
   </style>
-  <canvas id="view" aria-label="Track with live cars; drag to orbit, scroll to zoom"></canvas>
   <aside>
     <h1>WarpORacer <small>Mojo</small></h1>
-    <div class="muted" id="map">Loading terrain…</div>
-    <div class="row">
-      <button id="pause">Pause</button>
-      <button id="reset">Reset cars</button>
-      <button id="step">Step</button>
-    </div>
-    <label>Driver
-      <select id="driver">
-        <option value="manual">Keyboard</option>
-        <option value="policy">Policy</option>
-      </select>
-    </label>
-    <label>Camera
-      <select id="camera">
-        <option value="follow">Follow</option>
-        <option value="orbit">Orbit</option>
-        <option value="top">Top</option>
-      </select>
-    </label>
-    <label>Car
-      <select id="car"></select>
-    </label>
-    <label>Speed
-      <select id="rate">
-        <option value="0.25">¼×</option>
-        <option value="1" selected>1×</option>
-        <option value="4">4×</option>
-      </select>
-    </label>
+    <div class="muted" id="map">Loading track…</div>
+    <div class="row"><button id="pause">Pause</button><button id="reset">Reset cars</button><button id="step">Step</button></div>
+    <label>Driver <select id="driver"><option value="manual">Keyboard</option><option value="policy">Policy</option></select></label>
+    <label>Camera <select id="camera"><option value="follow">Follow</option><option value="orbit">Orbit</option><option value="top">Top</option></select></label>
+    <label>Car <select id="car"></select></label>
+    <label>Speed <select id="rate"><option value="0.25">¼×</option><option value="1" selected>1×</option><option value="4">4×</option></select></label>
     <label>Lidar <input id="lidar" type="checkbox" checked /></label>
     <label>Route <input id="route" type="checkbox" checked /></label>
     <dl>
-      <dt>Speed</dt>
-      <dd id="speed">—</dd>
-      <dt>Grade / height</dt>
-      <dd id="grade">—</dd>
-      <dt>Steering / throttle</dt>
-      <dd id="control">—</dd>
-      <dt>Episode reward</dt>
-      <dd id="reward">—</dd>
-      <dt>Progress</dt>
-      <dd id="progress">—</dd>
-      <dt>Resets / finishes</dt>
-      <dd id="events">0 / 0</dd>
+      <dt>Speed</dt><dd id="speed">—</dd>
+      <dt>Grade / height</dt><dd id="grade">—</dd>
+      <dt>Steering / throttle</dt><dd id="control">—</dd>
+      <dt>Episode return</dt><dd id="reward">—</dd>
+      <dt>Waypoint</dt><dd id="progress">—</dd>
+      <dt>Resets / crashes</dt><dd id="events">0 / 0</dd>
     </dl>
     <div id="status" aria-live="polite">Starting simulation…</div>
     <div id="error" aria-live="polite"></div>
-    <p class="muted">W/S or ↑/↓: throttle<br />A/D or ←/→: steer<br />Space: pause · R: reset</p>
-    <small>Drag to orbit · Scroll to zoom<br />Walls end an episode.</small>
+    <p class="muted">W/S or ↑/↓: throttle · A/D or ←/→: steer<br />Space: pause · R: reset · Drag to orbit</p>
   </aside>
-  <footer>60 Hz dynamics · terrain-following bicycle · 2-D lidar · live CPU / GPU simulation</footer>
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+                   "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/" } }
+  </script>
   <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
     const $ = (id) => document.getElementById(id);
-    const canvas = $("view"),
-      gl = canvas.getContext("webgl", { antialias: true });
-    if (!gl) {
-      $("error").textContent = "WebGL is unavailable in this browser.";
-      throw new Error("WebGL is unavailable in this browser.");
-    }
-    const shader = (type, source) => {
-      const s = gl.createShader(type);
-      gl.shaderSource(s, source);
-      gl.compileShader(s);
-      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(s));
-      return s;
-    };
-    const program = gl.createProgram();
-    gl.attachShader(
-      program,
-      shader(
-        gl.VERTEX_SHADER,
-        "attribute vec3 position;attribute vec3 colour;uniform mat4 vp;varying vec3 c;void main(){gl_Position=vp*vec4(position,1.);c=colour;}",
-      ),
-    );
-    gl.attachShader(
-      program,
-      shader(
-        gl.FRAGMENT_SHADER,
-        "precision mediump float;varying vec3 c;void main(){gl_FragColor=vec4(c,1.);}",
-      ),
-    );
-    gl.linkProgram(program);
-    gl.useProgram(program);
-    const vpLocation = gl.getUniformLocation(program, "vp");
-    const attributes = ["position", "colour"].map((x) => gl.getAttribLocation(program, x));
-    gl.enable(gl.DEPTH_TEST);
-    gl.clearColor(0.055, 0.085, 0.11, 1);
-    const add = (a, b) => a.map((v, i) => v + b[i]),
-      sub = (a, b) => a.map((v, i) => v - b[i]),
-      scale = (a, s) => a.map((v) => v * s);
-    const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0),
-      cross = (a, b) => [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-      ];
-    const unit = (a) => scale(a, 1 / Math.max(Math.hypot(...a), 1e-9));
-    const multiply = (a, b) =>
-      Array.from({ length: 16 }, (_, i) => {
-        let s = 0;
-        for (let k = 0; k < 4; k++) s += a[k * 4 + (i % 4)] * b[Math.floor(i / 4) * 4 + k];
-        return s;
-      });
-    function view(eye, target) {
-      const z = unit(sub(eye, target)),
-        x = unit(cross([0, 0, 1], z)),
-        y = cross(z, x);
-      return [
-        x[0], y[0], z[0], 0,
-        x[1], y[1], z[1], 0,
-        x[2], y[2], z[2], 0,
-        -dot(x, eye), -dot(y, eye), -dot(z, eye), 1,
-      ];
-    }
-    function perspective(aspect) {
-      const f = 1 / Math.tan(Math.PI / 7),
-        near = 0.05,
-        far = 300;
-      return [
-        f / aspect, 0, 0, 0,
-        0, f, 0, 0,
-        0, 0, (far + near) / (near - far), -1,
-        0, 0, (2 * far * near) / (near - far), 0,
-      ];
-    }
-    function mesh(vertices, colours, mode, existing = null) {
-      const buffers = existing?.buffers ?? [gl.createBuffer(), gl.createBuffer()];
-      [vertices, colours].forEach((values, i) => {
-        gl.bindBuffer(gl.ARRAY_BUFFER, buffers[i]);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(values), existing ? gl.DYNAMIC_DRAW : gl.STATIC_DRAW);
-      });
-      return { buffers, count: vertices.length / 3, mode };
-    }
-    function draw(m) {
-      m.buffers.forEach((b, i) => {
-        gl.bindBuffer(gl.ARRAY_BUFFER, b);
-        gl.enableVertexAttribArray(attributes[i]);
-        gl.vertexAttribPointer(attributes[i], 3, gl.FLOAT, false, 0, 0);
-      });
-      gl.drawArrays(m.mode, 0, m.count);
-    }
-    function lines(vertices, colour, existing = null) {
-      return mesh(
-        vertices,
-        Array.from({ length: vertices.length / 3 }, () => colour).flat(),
-        gl.LINES,
-        existing,
-      );
-    }
-    function buildScene(d, info) {
-      // Decode the raw .wrmap: header, clearance and height grids, route
-      // segments, spawn table, coarse-cell triangle lists, triangles (a, b - a, c - a).
-      const nx = d[2], ny = d[3], count = d[8], cells = nx * ny;
-      const segments = 16 + 2 * cells, spawns = segments + 9 * count;
-      const starts = spawns + d[10], items = starts + d[11] * d[12] + 1;
-      const triangles = items + d[15], total = d[14];
-      const vertices = new Float32Array(total * 9), colours = new Float32Array(total * 9);
-      const light = [0.3, -0.4, 0.86], lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-      for (let t = 0; t < total; t++) {
-        const o = triangles + t * 9;
-        const a = [d[o], d[o + 1], d[o + 2]], e1 = [d[o + 3], d[o + 4], d[o + 5]], e2 = [d[o + 6], d[o + 7], d[o + 8]];
-        const normal = unit(cross(e1, e2)), wall = Math.abs(normal[2]) < 0.1;
-        const shade = 0.65 + 0.35 * Math.abs(dot(normal, light));
-        const colour = (wall ? [0.65, 0.25, 0.18] : [0.29, 0.36, 0.39]).map((c) => c * shade);
-        [a, add(a, e1), add(a, e2)].forEach((v, i) => {
-          vertices.set(v, t * 9 + i * 3);
-          colours.set(colour, t * 9 + i * 3);
-          for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], v[k]); hi[k] = Math.max(hi[k], v[k]); }
-        });
+    const info = await (await fetch("/info")).json();
+    const d = new Float32Array(await (await fetch("/map")).arrayBuffer());
+    // Track array (racer/track.py): header, then per layer the clearance, height and
+    // nearest-waypoint grids (row-major, a float per cell), then the route (x, y, z, heading).
+    const [nx, ny, x0, y0, cell, waypoints, , layers] = d, cells = nx * ny;
+    const grid = (layer, which) => d.subarray(12 + (3 * layer + which) * cells, 12 + (3 * layer + which + 1) * cells);
+    const route = d.subarray(12 + 3 * layers * cells, 12 + 3 * layers * cells + waypoints * 4);
+    const FOV = 1.5 * Math.PI, WALL = 0.5; // lidar field of view; how far wall cells rise above the road
+    const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+
+    $("map").textContent = `${info.name} · ${info.cars} cars · ${layers} layer${layers > 1 ? "s" : ""}`;
+    $("driver").value = info.policy ? "policy" : "manual";
+    $("driver").options[1].disabled = !info.policy;
+    for (let i = 0; i < info.cars; i++) $("car").add(new Option(i + 1, i));
+
+    THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0e161c);
+    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+    sun.position.set(0.3, -0.4, 0.86);
+    scene.add(new THREE.HemisphereLight(0xbfd4e6, 0x2a2420, 0.9), sun);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    document.body.prepend(renderer.domElement);
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 1000);
+    const centre = new THREE.Vector3(x0 + ((nx - 1) * cell) / 2, y0 + ((ny - 1) * cell) / 2, 0), extent = Math.max(nx, ny) * cell;
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.copy(centre);
+    const overview = centre.clone().addScaledVector(new THREE.Vector3(0.6, -0.8, 0.7), extent);
+    function orbit() { camera.position.copy(overview); $("camera").value = "orbit"; } // entering orbit mode restarts from the overview
+    $("camera").onchange = () => $("camera").value === "orbit" && orbit();
+    renderer.domElement.addEventListener("pointerdown", () => $("camera").value !== "orbit" && orbit());
+    camera.position.copy(overview);
+
+    // One mesh per layer, a vertex per cell: road cells in asphalt, the band just outside
+    // raised as a wall, cells farther out left unmeshed. Lambert shading shows the slopes.
+    const road = new THREE.Color(0x4a5560), wall = new THREE.Color(0xa6412e);
+    for (let l = 0; l < layers; l++) {
+      const clearance = grid(l, 0), height = grid(l, 1), shown = (k) => clearance[k] > -0.4;
+      const position = new Float32Array(cells * 3), colour = new Float32Array(cells * 3);
+      const index = new Uint32Array((nx - 1) * (ny - 1) * 6);
+      let n = 0;
+      for (let k = 0; k < cells; k++) {
+        position.set([x0 + (k % nx) * cell, y0 + Math.floor(k / nx) * cell, height[k] + (clearance[k] > 0 ? 0 : WALL)], 3 * k);
+        (clearance[k] > 0 ? road : wall).toArray(colour, 3 * k);
       }
-      const route = [];
-      for (let i = 0; i < count; i++) route.push(d[segments + i * 9], d[segments + i * 9 + 1], d[segments + i * 9 + 2]);
-      return {
-        ...info,
-        vertices,
-        colours,
-        route,
-        closed: d[7] > 0,
-        centre: [(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2],
-        extent: Math.max(hi[0] - lo[0], hi[1] - lo[1]),
-        grid: { nx, ny, x: d[4], y: d[5], cell: d[6], height: d.subarray(16 + cells, 16 + 2 * cells) },
-      };
+      for (let iy = 0; iy + 1 < ny; iy++)
+        for (let ix = 0; ix + 1 < nx; ix++) {
+          const k = iy * nx + ix;
+          if (!shown(k) || !shown(k + 1) || !shown(k + nx) || !shown(k + nx + 1)) continue;
+          index.set([k, k + 1, k + nx, k + 1, k + nx + 1, k + nx], n);
+          n += 6;
+        }
+      const geometry = new THREE.BufferGeometry().setIndex(new THREE.BufferAttribute(index.subarray(0, n), 1));
+      geometry.setAttribute("position", new THREE.BufferAttribute(position, 3)).setAttribute("color", new THREE.BufferAttribute(colour, 3));
+      geometry.computeVertexNormals();
+      scene.add(new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide })));
     }
-    const scene = buildScene(
-      new Float32Array(await fetch("/map").then((r) => r.arrayBuffer())),
-      await fetch("/info").then((r) => r.json()),
-    );
-    $("map").textContent = scene.name + " · " + scene.cars + " cars";
-    $("driver").value = scene.policy ? "policy" : "manual";
-    $("driver").options[1].disabled = !scene.policy;
-    for (let i = 0; i < scene.cars; i++) $("car").add(new Option(String(i + 1), String(i)));
-    const road = mesh(scene.vertices, scene.colours, gl.TRIANGLES);
-    function surface(x, y) {
-      // Bilinear height between cell centres, the same patch the physics uses.
-      const g = scene.grid, fx = (x - g.x) / g.cell, fy = (y - g.y) / g.cell;
-      const ix = Math.floor(fx), iy = Math.floor(fy), tx = fx - ix, ty = fy - iy;
-      if (ix < 0 || iy < 0 || ix + 1 >= g.nx || iy + 1 >= g.ny) return { z: 0, sx: 0, sy: 0 };
-      const k = iy * g.nx + ix, h00 = g.height[k], h10 = g.height[k + 1], h01 = g.height[k + g.nx], h11 = g.height[k + g.nx + 1];
-      return {
-        z: h00 * (1 - tx) * (1 - ty) + h10 * tx * (1 - ty) + h01 * (1 - tx) * ty + h11 * tx * ty,
-        sx: ((h10 - h00) * (1 - ty) + (h11 - h01) * ty) / g.cell,
-        sy: ((h01 - h00) * (1 - tx) + (h11 - h10) * tx) / g.cell,
-      };
+    const loop = Array.from({ length: waypoints + 1 }, (_, w) => route.subarray((w % waypoints) * 4, (w % waypoints) * 4 + 3));
+    const routeGeometry = new THREE.BufferGeometry().setFromPoints(loop.map(([x, y, z]) => new THREE.Vector3(x, y, z + 0.02)));
+    const routeLine = new THREE.Line(routeGeometry, new THREE.LineBasicMaterial({ color: 0x55a6b3 }));
+    const cars = new THREE.InstancedMesh(new THREE.BoxGeometry(0.58, 0.42, 0.15), new THREE.MeshLambertMaterial(), info.cars);
+    const beamGeometry = new THREE.BufferGeometry().setAttribute("position", new THREE.BufferAttribute(new Float32Array(info.beams * 6), 3));
+    const lidar = new THREE.LineSegments(beamGeometry, new THREE.LineBasicMaterial({ color: 0x5d93a8, transparent: true, opacity: 0.7 }));
+    cars.frustumCulled = lidar.frustumCulled = false; // their bounds are only computed once, before anything moves
+    scene.add(routeLine, cars, lidar);
+
+    // Snapshots are feature-major: state rows, observation rows, two action rows, reward, done.
+    const [X, Y, Z, HEADING, SPEED, STEER, PROGRESS, EPISODE, RETURN] = [0, 1, 2, 3, 4, 5, 7, 8, 10];
+    const BEAM = info.state + 4, THROTTLE = info.state + info.obs + 1, DONE = THROTTLE + 2;
+    let snap = null, paused = false, reset = false, resets = 0, crashes = 0;
+    const at = (row, i) => snap[row * info.cars + i];
+    const episodes = Array(info.cars).fill(-1), keys = new Set();
+
+    function slope(x, y, z) {
+      // Bilinear height gradient of the drivable layer nearest z, the one the sim drives on.
+      const fx = (x - x0) / cell, fy = (y - y0) / cell;
+      const ix = clamp(Math.floor(fx), 0, nx - 2), iy = clamp(Math.floor(fy), 0, ny - 2), k = iy * nx + ix;
+      const tx = clamp(fx - ix, 0, 1), ty = clamp(fy - iy, 0, 1);
+      let best = 0, gap = Infinity;
+      for (let l = 0; l < layers; l++) {
+        const g = Math.abs(grid(l, 1)[k] - z);
+        if (grid(l, 0)[k] > 0 && g < gap) [best, gap] = [l, g];
+      }
+      const h = grid(best, 1);
+      return [((h[k + 1] - h[k]) * (1 - ty) + (h[k + nx + 1] - h[k + nx]) * ty) / cell, ((h[k + nx] - h[k]) * (1 - tx) + (h[k + nx + 1] - h[k + 1]) * tx) / cell];
     }
-    function attitude(x, y, heading) {
-      // Height and slope from the ground under the four wheels (racer/simulation.mojo
-      // `attitude`); AXLE and TRACK match racer/vehicle.mojo.
-      const AXLE = 0.1651, TRACK = 0.37, c = Math.cos(heading), s = Math.sin(heading),
-        front = surface(x + AXLE * c, y + AXLE * s).z, rear = surface(x - AXLE * c, y - AXLE * s).z,
-        left = surface(x - 0.5 * TRACK * s, y + 0.5 * TRACK * c).z,
-        right = surface(x + 0.5 * TRACK * s, y - 0.5 * TRACK * c).z,
-        along = (front - rear) / (2 * AXLE), across = (left - right) / TRACK;
-      return { z: 0.25 * (front + rear + left + right), sx: along * c - across * s, sy: along * s + across * c };
+    function frame(i) {
+      // Car i's position and tilted basis: forward follows the slope, up is the terrain normal.
+      const h = at(HEADING, i), [sx, sy] = slope(at(X, i), at(Y, i), at(Z, i));
+      const forward = new THREE.Vector3(Math.cos(h), Math.sin(h), sx * Math.cos(h) + sy * Math.sin(h)).normalize();
+      const up = new THREE.Vector3(-sx, -sy, 1).normalize();
+      return { position: new THREE.Vector3(at(X, i), at(Y, i), at(Z, i)), forward, up, left: up.clone().cross(forward) };
     }
-    // Snapshots are feature-major: the state rows, then observations, actions, reward, done.
-    const row = (k) => k * scene.cars;
-    const BEAM = scene.state + 8, THROTTLE = scene.state + scene.obs + 1, DONE = THROTTLE + 2;
-    const routeVertices = [];
-    for (let i = 3; i < scene.route.length + (scene.closed ? 3 : 0); i += 3) {
-      const a = scene.route.slice(i - 3, i),
-        b = scene.route.slice(i % scene.route.length, (i % scene.route.length) + 3);
-      routeVertices.push(...add(a, [0, 0, 0.015]), ...add(b, [0, 0, 0.015]));
+    const matrix = new THREE.Matrix4(), selectedColour = new THREE.Color(0xfaa645), otherColour = new THREE.Color(0x4fb0a3);
+    function drawCars(selected) {
+      for (let i = 0; i < info.cars; i++) {
+        const { position, forward, up, left } = frame(i);
+        cars.setMatrixAt(i, matrix.makeBasis(forward, left, up).setPosition(position.addScaledVector(up, 0.075)));
+        cars.setColorAt(i, i === selected ? selectedColour : otherColour);
+      }
+      cars.instanceMatrix.needsUpdate = cars.instanceColor.needsUpdate = true;
     }
-    const route = lines(routeVertices, [0.33, 0.65, 0.7]);
-    let state = null,
-      paused = false,
-      reset = false,
-      steer = 0,
-      yaw = 0.9,
-      elevation = 0.65,
-      zoom = 1,
-      drag = null,
-      totalResets = 0,
-      totalFinishes = 0;
-    const keys = new Set(),
-      trails = Array.from({ length: scene.cars }, () => []),
-      episodes = Array(scene.cars).fill(-1);
-    function togglePause() {
-      paused = !paused;
-      $("pause").textContent = paused ? "Play" : "Pause";
+    function drawLidar(i) {
+      const { position, forward, left } = frame(i), p = lidar.geometry.attributes.position;
+      const origin = position.addScaledVector(forward, info.mount[0]).add(new THREE.Vector3(0, 0, info.mount[2]));
+      for (let b = 0; b < info.beams; b++) {
+        const az = -FOV / 2 + (b * FOV) / (info.beams - 1), r = at(BEAM + b, i) * info.range;
+        const end = origin.clone().addScaledVector(forward, r * Math.cos(az)).addScaledVector(left, r * Math.sin(az));
+        p.setXYZ(2 * b, origin.x, origin.y, origin.z);
+        p.setXYZ(2 * b + 1, end.x, end.y, end.z);
+      }
+      p.needsUpdate = true;
     }
+    function render() {
+      const i = Number($("car").value), mode = $("camera").value;
+      camera.up.set(0, mode === "top" ? 1 : 0, mode === "top" ? 0 : 1); // looking straight down, keep north up
+      routeLine.visible = $("route").checked;
+      lidar.visible = Boolean(snap) && $("lidar").checked;
+      if (snap) {
+        drawCars(i);
+        if (lidar.visible) drawLidar(i);
+        const { position, forward } = frame(i);
+        if (mode === "follow") {
+          camera.position.copy(position).addScaledVector(forward, -2.5).add(new THREE.Vector3(0, 0, 1.3));
+          camera.lookAt(position.x, position.y, position.z + 0.3);
+        }
+        $("speed").textContent = at(SPEED, i).toFixed(2) + " m/s";
+        $("grade").textContent = ((Math.asin(forward.z) * 180) / Math.PI).toFixed(1) + "° / " + position.z.toFixed(2) + " m";
+        $("control").textContent = ((at(STEER, i) * 180) / Math.PI).toFixed(1) + "° / " + clamp(at(THROTTLE, i), -1, 1).toFixed(2);
+        $("reward").textContent = at(RETURN, i).toFixed(1);
+        $("progress").textContent = at(PROGRESS, i).toFixed(1) + " / " + waypoints;
+        $("events").textContent = resets + " / " + crashes;
+      }
+      if (mode === "top") camera.position.set(centre.x, centre.y, extent), camera.lookAt(centre);
+      else if (mode === "orbit") controls.update();
+      renderer.render(scene, camera);
+    }
+    function resize() { renderer.setSize(innerWidth, innerHeight); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+    addEventListener("resize", resize);
+    resize();
+    renderer.setAnimationLoop(render);
+
+    const togglePause = () => ($("pause").textContent = (paused = !paused) ? "Play" : "Pause");
     $("pause").onclick = togglePause;
-    $("reset").onclick = () => {
-      reset = true;
-    };
+    $("reset").onclick = () => (reset = true);
     $("step").onclick = () => tick();
     addEventListener("keydown", (e) => {
-      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key))
-        e.preventDefault();
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
       if (e.target.tagName === "SELECT") return;
       keys.add(e.key.toLowerCase());
       if (!e.repeat && e.code === "Space") togglePause();
@@ -382,191 +202,18 @@
     });
     addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
     addEventListener("blur", () => keys.clear());
-    canvas.onpointerdown = (e) => {
-      drag = [e.clientX, e.clientY];
-      canvas.setPointerCapture(e.pointerId);
-      $("camera").value = "orbit";
-    };
-    canvas.onpointermove = (e) => {
-      if (drag) {
-        yaw -= (e.clientX - drag[0]) * 0.006;
-        elevation = Math.max(0.08, Math.min(1.5, elevation + (e.clientY - drag[1]) * 0.006));
-        drag = [e.clientX, e.clientY];
-      }
-    };
-    canvas.onpointerup = () => {
-      drag = null;
-    };
-    canvas.onwheel = (e) => {
-      e.preventDefault();
-      zoom = Math.max(0.3, Math.min(5, zoom * Math.exp(e.deltaY * 0.001)));
-    };
-    function frame(i) {
-      const s = Array.from({ length: scene.state }, (_, k) => state[row(k) + i]),
-        ground = attitude(s[0], s[1], s[2]),
-        up = unit([-ground.sx, -ground.sy, 1]),
-        f = unit([
-          Math.cos(s[2]),
-          Math.sin(s[2]),
-          ground.sx * Math.cos(s[2]) + ground.sy * Math.sin(s[2]),
-        ]);
-      return { s, up, f, left: cross(up, f), p: [s[0], s[1], ground.z] };
-    }
-    const boxFaces = [
-      [0, 2, 1, 1, 2, 3],
-      [4, 5, 6, 5, 7, 6],
-      [0, 1, 4, 1, 5, 4],
-      [2, 6, 3, 3, 6, 7],
-      [0, 4, 2, 2, 4, 6],
-      [1, 3, 5, 3, 7, 5],
-    ].flat();
-    function box(vertices, colours, p, f, l, u, size, colour) {
-      const corners = Array.from({ length: 8 }, (_, i) =>
-        add(
-          p,
-          add(
-            scale(f, ((i & 1 ? 1 : -1) * size[0]) / 2),
-            add(
-              scale(l, ((i & 2 ? 1 : -1) * size[1]) / 2),
-              scale(u, ((i & 4 ? 1 : -1) * size[2]) / 2),
-            ),
-          ),
-        ),
-      );
-      for (const i of boxFaces) {
-        vertices.push(...corners[i]);
-        colours.push(...colour);
-      }
-    }
-    function cars(existing) {
-      const vertices = [],
-        colours = [];
-      for (let i = 0; i < scene.cars; i++) {
-        const { s, p, f, left, up } = frame(i),
-          selected = i === Number($("car").value);
-        box(
-          vertices,
-          colours,
-          add(p, scale(up, 0.14)),
-          f,
-          left,
-          up,
-          [0.58, 0.32, 0.15],
-          selected ? [0.98, 0.65, 0.27] : [0.31, 0.69, 0.64],
-        );
-        box(
-          vertices,
-          colours,
-          add(add(p, scale(up, 0.235)), scale(f, -0.05)),
-          f,
-          left,
-          up,
-          [0.23, 0.25, 0.08],
-          [0.12, 0.19, 0.23],
-        );
-        for (const x of [-0.1651, 0.1651])
-          for (const y of [-0.185, 0.185]) {
-            const a = x > 0 ? s[6] : 0,
-              wf = add(scale(f, Math.cos(a)), scale(left, Math.sin(a))),
-              wl = cross(up, wf);
-            box(
-              vertices,
-              colours,
-              add(p, add(scale(f, x), add(scale(left, y), scale(up, 0.065)))),
-              wf,
-              wl,
-              up,
-              [0.13, 0.07, 0.13],
-              [0.075, 0.085, 0.1],
-            );
-          }
-      }
-      return mesh(vertices, colours, gl.TRIANGLES, existing);
-    }
-    const carMesh = mesh([], [], gl.TRIANGLES),
-      trailMesh = lines([], [0.98, 0.65, 0.27]),
-      lidarMesh = lines([], [0.3, 0.48, 0.55]);
-    function render() {
-      const dpr = Math.min(devicePixelRatio, 2);
-      const width = Math.round(innerWidth * dpr), height = Math.round(innerHeight * dpr);
-      if (canvas.width !== width || canvas.height !== height) {
-        canvas.width = width;
-        canvas.height = height;
-      }
-      gl.viewport(0, 0, canvas.width, canvas.height);
-      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      let target = scene.centre,
-        eye;
-      if (state && $("camera").value === "follow") {
-        const { p, f } = frame(Number($("car").value));
-        target = add(p, [0, 0, 0.1]);
-        eye = add(target, add(scale(f, -3 * zoom), [0, 0, 2 * zoom]));
-      } else if ($("camera").value === "top") {
-        eye = add(target, [0.01, 0, scene.extent * 0.85 * zoom]);
-      } else {
-        const radius = scene.extent * 1.1 * zoom;
-        eye = add(target, [
-          radius * Math.cos(yaw) * Math.cos(elevation),
-          radius * Math.sin(yaw) * Math.cos(elevation),
-          radius * Math.sin(elevation),
-        ]);
-      }
-      gl.uniformMatrix4fv(
-        vpLocation,
-        false,
-        new Float32Array(multiply(perspective(canvas.width / canvas.height), view(eye, target))),
-      );
-      draw(road);
-      if ($("route").checked) draw(route);
-      if (state) {
-        draw(cars(carMesh));
-        const i = Number($("car").value),
-          { s, p, f, left, up } = frame(i),
-          v = [];
-        for (let j = 1; j < trails[i].length; j++) v.push(...trails[i][j - 1], ...trails[i][j]);
-        draw(lines(v, [0.98, 0.65, 0.27], trailMesh));
-        if ($("lidar").checked) {
-          const beams = [],
-            origin = add(p, add(scale(f, scene.mount[0]), scale(up, scene.mount[2])));
-          for (let b = 0; b < scene.beams; b++) {
-            const azimuth = -Math.PI * 0.75 + (b * Math.PI * 1.5) / (scene.beams - 1),
-              distance = state[row(BEAM + b) + i] * scene.range,
-              direction = add(scale(f, Math.cos(azimuth)), scale(left, Math.sin(azimuth)));
-            beams.push(...origin, ...add(origin, scale(direction, distance)));
-          }
-          draw(lines(beams, [0.3, 0.48, 0.55], lidarMesh));
-        }
-        $("speed").textContent = Math.hypot(s[3], s[4]).toFixed(2) + " m/s";
-        $("grade").textContent =
-          ((Math.asin(f[2]) * 180) / Math.PI).toFixed(1) + "° / " + p[2].toFixed(2) + " m";
-        $("control").textContent =
-          ((s[6] * 180) / Math.PI).toFixed(1) +
-          "° / " +
-          Math.max(-1, Math.min(1, state[row(THROTTLE) + i])).toFixed(2);
-        $("reward").textContent = s[12].toFixed(2);
-        $("progress").textContent = s[7].toFixed(1) + " m";
-        $("events").textContent = totalResets + " / " + totalFinishes;
-      }
-      requestAnimationFrame(render);
-    }
-    let busy = false,
-      lastTick = 0;
+
+    let busy = false, lastTick = 0;
     async function tick() {
       if (busy) return;
       busy = true;
       try {
-        const direction =
-          (keys.has("a") || keys.has("arrowleft") ? 1 : 0) -
-          (keys.has("d") || keys.has("arrowright") ? 1 : 0);
-        // Actions are steering rates; return to centre when the keys are released.
-        const selectedSteer = state ? state[row(6) + Number($("car").value)] : 0;
-        steer = direction
-          ? direction * 100
-          : Math.max(-100, Math.min(100, ((-selectedSteer * 60) / 3.2) * 100));
-        const throttle =
-          ((keys.has("w") || keys.has("arrowup") ? 1 : 0) -
-            (keys.has("s") || keys.has("arrowdown") ? 1 : 0)) *
-          100;
+        const pressed = (...names) => names.some((k) => keys.has(k));
+        const direction = (pressed("a", "arrowleft") ? 1 : 0) - (pressed("d", "arrowright") ? 1 : 0);
+        // Actions are steering rates: without input, steer back to centre (STEER_RATE 3.2 rad/s at 60 Hz).
+        const current = snap ? at(STEER, Number($("car").value)) : 0;
+        const steer = direction ? direction * 100 : clamp((-current * 60 * 100) / 3.2, -100, 100);
+        const throttle = ((pressed("w", "arrowup") ? 1 : 0) - (pressed("s", "arrowdown") ? 1 : 0)) * 100;
         const response = await fetch("/step", {
           method: "POST",
           headers: { "Content-Type": "text/plain" },
@@ -574,23 +221,13 @@
         });
         reset = false;
         if (!response.ok) throw Error(await response.text());
-        state = new Float32Array(await response.arrayBuffer());
-        for (let i = 0; i < scene.cars; i++) {
-          const { s, p } = frame(i);
-          if (episodes[i] !== s[9]) {
-            trails[i] = [];
-            if (episodes[i] >= 0) totalResets++;
-            episodes[i] = s[9];
-          }
-          trails[i].push(add(p, [0, 0, 0.025]));
-          if (trails[i].length > 240) trails[i].shift();
-          if (state[row(DONE) + i] === 3) totalFinishes++;
+        snap = new Float32Array(await response.arrayBuffer());
+        for (let i = 0; i < info.cars; i++) {
+          if (episodes[i] !== at(EPISODE, i) && episodes[i] >= 0) resets++;
+          episodes[i] = at(EPISODE, i);
+          if (at(DONE, i) === 1) crashes++;
         }
-        $("status").textContent = paused
-          ? "Paused"
-          : $("driver").value === "policy"
-            ? "Policy running"
-            : "Keyboard driving";
+        $("status").textContent = paused ? "Paused" : $("driver").value === "policy" ? "Policy running" : "Keyboard driving";
       } catch (e) {
         paused = true;
         $("error").textContent = e.message;
@@ -608,7 +245,6 @@
       requestAnimationFrame(animate);
     }
     await tick();
-    requestAnimationFrame(render);
     requestAnimationFrame(animate);
   </script>
 </html>
